@@ -345,17 +345,16 @@ async def activate_account(acc: Account) -> bool:
         async with _new_browser() as browser:
             page = await browser.new_page()
 
-            # Step 1: Open the inbox page — use networkidle to wait for SPA AJAX to complete
+            # Step 1: Open the inbox page
             log.info(f"[Activate] 打开收件箱: {mail_url}")
             try:
-                await page.goto(mail_url, wait_until="networkidle", timeout=30000)
+                # 改用 domcontentloaded 极速加载，放弃等待所有网络请求（networkidle 太慢）
+                await page.goto(mail_url, wait_until="domcontentloaded", timeout=15000)
             except Exception:
-                try:
-                    await page.goto(mail_url, wait_until="domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-            # Extra wait for SPA to render inbox content
-            await asyncio.sleep(6)
+                pass
+            
+            # 缩短强制等待时间
+            await asyncio.sleep(2)
 
             # Step 2: Wait for email list to appear, then click the first email
             log.info(f"[Activate] 等待收件箱加载...")
@@ -366,11 +365,12 @@ async def activate_account(acc: Account) -> bool:
                         '[class*="email-item"]', '[class*="MailItem"]', '[class*="mail-item"]',
                         'table tbody tr:first-child', '[role="row"]:first-child']:
                 try:
-                    await page.wait_for_selector(sel, timeout=10000)
+                    # 缩短选择器超时
+                    await page.wait_for_selector(sel, timeout=3000)
                     el = await page.query_selector(sel)
                     if el:
                         await el.click()
-                        await asyncio.sleep(4)
+                        await asyncio.sleep(1)
                         clicked_email = True
                         log.debug(f"[Activate] 点击邮件项: {sel}")
                         break
@@ -387,7 +387,7 @@ async def activate_account(acc: Account) -> bool:
                                 text = await el.inner_text()
                                 if any(kw in text.lower() for kw in keywords):
                                     await el.click()
-                                    await asyncio.sleep(4)
+                                    await asyncio.sleep(1)
                                     clicked_email = True
                                     log.debug(f"[Activate] 按关键词点击邮件项: {sel}")
                                     break
@@ -398,8 +398,7 @@ async def activate_account(acc: Account) -> bool:
                     except Exception:
                         pass
 
-            # 新增增强型兜底策略（不修改上方原有代码）：
-            # 尝试通过评估页面内部所有的 iframe 和文本，强制将第一封邮件的 DOM 显示出来
+            # 新增增强型兜底策略
             if not clicked_email:
                 try:
                     log.info("[Activate] 尝试通过增强型 JavaScript 选择器点击第一封邮件")
@@ -407,7 +406,7 @@ async def activate_account(acc: Account) -> bool:
                         const emails = document.querySelectorAll('li, tr, .mail-item, .email-item');
                         if(emails.length > 0) { emails[0].click(); }
                     }''')
-                    await asyncio.sleep(4)
+                    await asyncio.sleep(1)
                 except Exception as e:
                     log.debug(f"[Activate] 增强型点击失败: {e}")
 
