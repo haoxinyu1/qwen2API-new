@@ -24,7 +24,13 @@ async def gemini_stream(model: str, request: Request):
     users_db = app.state.users_db
     client: QwenClient = app.state.qwen_client
     
-    token = request.query_params.get("key", "")
+    token = request.query_params.get("key", "").strip() or request.query_params.get("api_key", "").strip()
+    
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+    if not token:
+        token = request.headers.get("x-api-key", "").strip()
 
     from backend.core.config import API_KEYS, settings
     admin_k = settings.ADMIN_KEY

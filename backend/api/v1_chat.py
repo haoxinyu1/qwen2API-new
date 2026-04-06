@@ -22,7 +22,12 @@ async def chat_completions(request: Request):
 
     # 鉴权 (完全复原单文件逻辑)
     auth_header = request.headers.get("Authorization", "")
-    token = auth_header.split(" ")[1] if auth_header.startswith("Bearer ") else ""
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+
+    if not token:
+        token = request.headers.get("x-api-key", "").strip()
+    if not token:
+        token = request.query_params.get("key", "").strip() or request.query_params.get("api_key", "").strip()
 
     from backend.core.config import API_KEYS, settings
     admin_k = settings.ADMIN_KEY

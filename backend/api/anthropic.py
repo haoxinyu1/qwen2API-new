@@ -23,8 +23,17 @@ async def anthropic_messages(request: Request):
     client: QwenClient = app.state.qwen_client
 
     # 鉴权 (完全复原单文件逻辑)
-    auth_header = request.headers.get("x-api-key", "")
-    token = auth_header
+    token = request.headers.get("x-api-key", "").strip()
+
+    # Anthropic 请求可能没有传 x-api-key 而是使用 Bearer Token
+    if not token:
+        bearer = request.headers.get("Authorization", "")
+        if bearer.startswith("Bearer "):
+            token = bearer[7:].strip()
+
+    # 有些工具可能会传在 querystring 中
+    if not token:
+        token = request.query_params.get("key", "").strip() or request.query_params.get("api_key", "").strip()
 
     from backend.core.config import API_KEYS, settings
     admin_k = settings.ADMIN_KEY
