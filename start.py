@@ -92,7 +92,7 @@ def start_backend() -> subprocess.Popen:
         env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        bufsize=1,
+        bufsize=0, # 在二进制模式下，使用无缓冲 (0) 或默认缓冲 (-1)，不能使用行缓冲 (1)
     )
     print(f"✓ Backend 进程已点火 (PID: {proc.pid})，正在初始化千问浏览器内核，请耐心等待...")
     
