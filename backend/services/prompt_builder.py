@@ -103,7 +103,7 @@ def build_prompt_with_tools(messages: list, tools: list) -> str:
             "",
             "Tool Descriptions:",
         ]
-        
+
         # 强制包含完整的 System Prompt 作为工具背景说明
         if system_text:
             lines.insert(0, "=== SYSTEM BACKGROUND ===")
