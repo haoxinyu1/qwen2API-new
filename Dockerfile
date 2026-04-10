@@ -7,15 +7,18 @@ COPY frontend/ ./
 RUN npm run build
 
 # Stage 2: Backend + Final Image
-FROM python:3.10-slim
+FROM python:3.11-slim
 WORKDIR /workspace
 
-# Install system dependencies required for headless Firefox (Camoufox)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Always refresh apt cache first (never cache this layer)
+RUN apt-get update
+
+# Install system dependencies for headless Firefox (Camoufox)
+# Use || true on packages that may differ across Debian versions
+RUN apt-get install -y --no-install-recommends \
     wget \
     curl \
     ca-certificates \
-    libx11-xcb1 \
     libx11-6 \
     libxcb1 \
     libxrandr2 \
@@ -24,12 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxfixes3 \
     libxext6 \
     libxkbcommon0 \
-    libdbus-glib-1-2 \
     libdbus-1-3 \
-    libxt6 \
     libgtk-3-0 \
-    libasound2 \
-    libpulse0 \
     libdrm2 \
     libgbm1 \
     libxshmfence1 \
@@ -41,7 +40,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libnspr4 \
     libglib2.0-0 \
     fonts-liberation \
-    fonts-noto-cjk \
+    && apt-get install -y --no-install-recommends fonts-noto-cjk || true \
+    && apt-get install -y --no-install-recommends libdbus-glib-1-2 || true \
+    && apt-get install -y --no-install-recommends libasound2 libasound2t64 || true \
+    && apt-get install -y --no-install-recommends libpulse0 || true \
+    && apt-get install -y --no-install-recommends libx11-xcb1 || true \
     && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONIOENCODING=utf-8
@@ -58,7 +61,7 @@ COPY backend/ ./backend/
 COPY start.py ./
 COPY --from=frontend-builder /app/dist ./frontend/dist
 
-# Create data directory
+# Create data and logs directories
 RUN mkdir -p /workspace/data /workspace/logs
 
 EXPOSE 7860

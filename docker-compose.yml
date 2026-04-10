@@ -1,10 +1,11 @@
 services:
   qwen2api:
-    build: .
+    image: yujunzhixue/qwen2api:latest
     container_name: qwen2api
     restart: unless-stopped
     env_file:
-      - .env
+      - path: .env
+        required: false
     ports:
       - "7860:7860"
     volumes:
@@ -13,6 +14,8 @@ services:
     shm_size: '256m'
     environment:
       PYTHONIOENCODING: utf-8
+      PORT: "7860"
+      ENGINE_MODE: "hybrid"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7860/healthz"]
       interval: 30s
