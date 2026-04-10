@@ -13,6 +13,7 @@ from backend.services.token_calc import calculate_usage
 from backend.services.prompt_builder import messages_to_prompt
 from backend.services.tool_parser import parse_tool_calls, inject_format_reminder, build_tool_blocks_from_native_chunks, should_block_tool_call
 from backend.core.config import resolve_model, settings, IMAGE_MODEL_DEFAULT
+from backend.core.tool_streaming import StreamingToolCallParser
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
@@ -312,7 +313,15 @@ async def chat_completions(request: Request):
                             aio.create_task(client.delete_chat(acc.token, chat_id))
                     return
 
-                # ── 有工具：缓冲完整响应后解析工具调用（原逻辑）──────────────
+                # ── 有工具：流式处理工具调用（优化版本）──────────────
+                parser = StreamingToolCallParser()
+                sent_role = False
+                mk = lambda delta, finish=None: json.dumps({
+                    "id": completion_id, "object": "chat.completion.chunk",
+                    "created": created, "model": model_name,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]
+                }, ensure_ascii=False)
+
                 async for item in _stream_items_with_keepalive(client, qwen_model, current_prompt, has_custom_tools=bool(tools), exclude_accounts=excluded_accounts):
                     if item["type"] == "keepalive":
                         yield ": keepalive\n\n"
@@ -325,52 +334,52 @@ async def chat_completions(request: Request):
                         yield ": upstream-connected\n\n"
                         continue
                     if item["type"] == "event":
-                        events.append(item["event"])
+                        evt = item["event"]
 
-                answer_text = ""
-                reasoning_text = ""
-                native_tc_chunks: dict = {}
-                for evt in events:
-                    if evt["type"] != "delta":
-                        continue
-                    phase = evt.get("phase", "")
-                    content = evt.get("content", "")
-                    if phase in ("think", "thinking_summary") and content:
-                        reasoning_text += content
-                    elif phase == "answer" and content:
-                        answer_text += content
-                    elif phase == "tool_call" and content:
-                        tc_id = evt.get("extra", {}).get("tool_call_id", "tc_0")
-                        if tc_id not in native_tc_chunks:
-                            native_tc_chunks[tc_id] = {"name": "", "args": ""}
-                        try:
-                            chunk = json.loads(content)
-                            if "name" in chunk:
-                                native_tc_chunks[tc_id]["name"] = chunk["name"]
-                            if "arguments" in chunk:
-                                native_tc_chunks[tc_id]["args"] += chunk["arguments"]
-                        except (json.JSONDecodeError, ValueError):
-                            native_tc_chunks[tc_id]["args"] += content
-                    if evt.get("status") == "finished" and phase == "answer":
-                        break
+                        # ✅ 流式处理事件，边收边解析工具调用
+                        should_emit, tool_block = parser.process_event(evt)
 
-                log.info(
-                    f"[OAI-诊断] 流式轮次={stream_attempt+1}/{settings.MAX_RETRIES} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} "
-                    f"native_tc_count={len(native_tc_chunks)} event_count={len(events)}"
-                )
-                if native_tc_chunks and not answer_text:
-                    log.info(f"[SSE-stream] 检测到 Qwen 原生 tool_call 事件: {list(native_tc_chunks.keys())}")
-                tool_blocks, stop = build_tool_blocks_from_native_chunks(native_tc_chunks, tools) if tools else ([], "end_turn")
+                        # 第一次发送role头
+                        if not sent_role:
+                            yield f"data: {mk({'role': 'assistant'})}\n\n"
+                            sent_role = True
+
+                        # 工具调用完成，立即发送
+                        if should_emit and tool_block:
+                            tool_idx = len([b for b in parser.completed_calls if b.get("type") == "tool_use"]) - 1
+                            yield f"data: {mk({'tool_calls': [{'index': tool_idx, 'id': tool_block['id'], 'type': 'function', 'function': {'name': tool_block['name'], 'arguments': ''}}]})}\n\n"
+                            yield f"data: {mk({'tool_calls': [{'index': tool_idx, 'function': {'arguments': json.dumps(tool_block.get('input', {}), ensure_ascii=False)}}]})}\n\n"
+                            log.info(f"[ToolStream] 工具调用已发送: {tool_block['name']} (流式)")
+
+                        # 转发答案文本
+                        if evt.get("phase") == "answer" and evt.get("content"):
+                            yield f"data: {mk({'content': evt.get('content')})}\n\n"
+
+                # 提取最终结果
+                answer_text = parser.answer_text
+                reasoning_text = parser.reasoning_text
+                tool_blocks = parser.completed_calls if parser.completed_calls else []
+
+                # 判断是否有工具调用
+                if parser.completed_calls and len(parser.completed_calls) > 0:
+                    has_tool_call = True
+                    log.info(f"[OAI-诊断] 流式轮次={stream_attempt+1}/{settings.MAX_RETRIES} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} tool_count={len(tool_blocks)} (流式处理)")
+                    stop = "tool_use"
+                else:
+                    has_tool_call = False
+                    stop = "end_turn"
+                    log.info(f"[OAI-诊断] 流式轮次={stream_attempt+1}/{settings.MAX_RETRIES} answer_len={len(answer_text)} reasoning_len={len(reasoning_text)} (无工具调用)")
+
                 if tool_blocks and stop == "tool_use":
                     tool_names = [b.get("name") for b in tool_blocks if b.get("type") == "tool_use"]
-                    log.info(f"[NativePass-OAI] 直接使用原生工具调用分片，count={len(tool_blocks)} tools={tool_names}")
+                    log.info(f"[NativePass-OAI] 直接使用流式工具调用，count={len(tool_blocks)} tools={tool_names}")
                 else:
                     tool_blocks, stop = parse_tool_calls(answer_text, tools)
                 has_tool_call = stop == "tool_use"
 
                 blocked_names = _extract_blocked_tool_names(answer_text.strip())
                 if blocked_names:
-                    log.info(f"[OAI-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} has_tool_call={has_tool_call} native_tc_count={len(native_tc_chunks)}")
+                    log.info(f"[OAI-诊断] 检测到上游拦截工具名 blocked_names={blocked_names} has_tool_call={has_tool_call}")
                 if blocked_names and tools and not has_tool_call and stream_attempt < max_attempts - 1:
                     blocked_name = blocked_names[0]
                     if acc is not None:
@@ -642,3 +651,27 @@ async def chat_completions(request: Request):
                 if stream_attempt == settings.MAX_RETRIES - 1:
                     raise HTTPException(status_code=500, detail=str(e))
                 await aio.sleep(1)
+
+
+@router.get("/models")
+@router.get("/v1/models")
+async def list_models(request: Request):
+    """List available models."""
+    # 模型列表
+    models = [
+        {"id": "qwen-max", "object": "model", "owned_by": "qwen", "permission": []},
+        {"id": "qwen-plus", "object": "model", "owned_by": "qwen", "permission": []},
+        {"id": "qwen-turbo", "object": "model", "owned_by": "qwen", "permission": []},
+        # OpenAI compatible aliases
+        {"id": "gpt-4o", "object": "model", "owned_by": "openai", "permission": []},
+        {"id": "gpt-4-turbo", "object": "model", "owned_by": "openai", "permission": []},
+        {"id": "gpt-3.5-turbo", "object": "model", "owned_by": "openai", "permission": []},
+        # Anthropic compatible aliases
+        {"id": "claude-opus-4-6", "object": "model", "owned_by": "anthropic", "permission": []},
+        {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "anthropic", "permission": []},
+        # Gemini compatible aliases
+        {"id": "gemini-2.5-pro", "object": "model", "owned_by": "google", "permission": []},
+        {"id": "gemini-2.5-flash", "object": "model", "owned_by": "google", "permission": []},
+    ]
+    return {"object": "list", "data": models}
+

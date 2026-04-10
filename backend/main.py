@@ -18,9 +18,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.core.config import settings
 from backend.core.database import AsyncJsonDB
-from backend.core.browser_engine import BrowserEngine
 from backend.core.httpx_engine import HttpxEngine
-from backend.core.hybrid_engine import HybridEngine
 from backend.core.account_pool import AccountPool
 from backend.services.qwen_client import QwenClient
 from backend.api import admin, v1_chat, probes, anthropic, gemini, embeddings, images
@@ -31,27 +29,16 @@ log = logging.getLogger("qwen2api")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting qwen2API v2.0 Enterprise Gateway...")
+    log.info("Starting qwen2API v2.0 Enterprise Gateway (HttpxEngine)...")
 
     app.state.accounts_db = AsyncJsonDB(settings.ACCOUNTS_FILE, default_data=[])
     app.state.users_db = AsyncJsonDB(settings.USERS_FILE, default_data=[])
     app.state.captures_db = AsyncJsonDB(settings.CAPTURES_FILE, default_data=[])
 
-    browser_engine = BrowserEngine(pool_size=settings.BROWSER_POOL_SIZE)
-    httpx_engine = HttpxEngine(base_url="https://chat.qwen.ai")
+    # 单一 HTTP 引擎，无浏览器依赖
+    engine = HttpxEngine(base_url="https://chat.qwen.ai")
+    log.info("引擎模式: HttpxEngine (纯 HTTP + curl_cffi Chrome 指纹伪装)")
 
-    if settings.ENGINE_MODE == "httpx":
-        engine = httpx_engine
-        log.info("引擎模式: httpx 直连")
-    elif settings.ENGINE_MODE == "hybrid":
-        engine = HybridEngine(browser_engine, httpx_engine)
-        log.info("引擎模式: Hybrid (api_call=httpx优先, fetch_chat=browser)")
-    else:
-        engine = browser_engine
-        log.info("引擎模式: Camoufox 浏览器")
-
-    app.state.browser_engine = browser_engine
-    app.state.httpx_engine = httpx_engine
     app.state.gateway_engine = engine
     app.state.account_pool = AccountPool(app.state.accounts_db, max_inflight=settings.MAX_INFLIGHT_PER_ACCOUNT)
     app.state.qwen_client = QwenClient(engine, app.state.account_pool)

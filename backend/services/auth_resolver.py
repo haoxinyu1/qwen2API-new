@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from backend.core.account_pool import AccountPool, Account
-from backend.core.browser_engine import _new_browser
+# from backend.core.browser_engine import _new_browser  # 已删除浏览器支持
 from backend.core.config import settings
 from backend.core.account_pool import Account
 import logging
@@ -13,7 +13,7 @@ import json
 import html as html_lib
 import re
 from typing import Optional
-from camoufox.async_api import AsyncCamoufox
+# from camoufox.async_api import AsyncCamoufox  # 已删除浏览器支持
 
 log = logging.getLogger(__name__)
 
@@ -46,7 +46,6 @@ async def _verify_qwen_token(token: str) -> bool:
     except Exception:
         return False
 
-from backend.core.browser_engine import _new_browser
 
 async def get_fresh_token(email: str, password: str) -> str:
     """如果提供了此功能，用 playwright 重新登录获取 Token，这里提供一个 mock 或抛错以防未实现"""

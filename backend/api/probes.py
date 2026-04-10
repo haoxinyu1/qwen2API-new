@@ -11,12 +11,7 @@ async def healthz():
 @router.get("/readyz")
 async def readyz(request: Request):
     gateway_engine = getattr(request.app.state, "gateway_engine", None)
-    browser_engine = getattr(request.app.state, "browser_engine", None)
     if gateway_engine and getattr(gateway_engine, "_started", False):
-        if getattr(getattr(request.app.state, "gateway_engine", None), "__class__", type("", (), {})).__name__ == "HybridEngine":
-            if browser_engine and getattr(browser_engine, "_started", False):
-                return {"status": "ready"}
-            raise HTTPException(status_code=503, detail="browser engine not ready")
         return {"status": "ready"}
     raise HTTPException(status_code=503, detail="gateway not ready")
 

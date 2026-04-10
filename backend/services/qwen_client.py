@@ -38,25 +38,9 @@ class QwenClient:
         body = {"title": f"api_{ts}", "models": [model], "chat_mode": "normal",
                 "chat_type": chat_type, "timestamp": ts}
 
-        # chat 生命周期接口也优先走浏览器，更贴近真人使用路径
-        if hasattr(self.engine, "browser_engine") and getattr(self.engine, "browser_engine") is not None:
-            r = await self.engine.browser_engine.api_call("POST", "/api/v2/chats/new", token, body)
-            status = r.get("status")
-            body_text = (r.get("body") or "").lower()
-            should_fallback = (
-                status == 0
-                or status in (401, 403, 429)
-                or "waf" in body_text
-                or "<!doctype" in body_text
-                or "forbidden" in body_text
-                or "unauthorized" in body_text
-            )
-            if should_fallback:
-                preview = (r.get("body") or "")[:160].replace("\n", "\\n")
-                log.warning(f"[QwenClient] create_chat 浏览器失败，回退到默认引擎 status={status} body_preview={preview!r}")
-                r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
-        else:
-            r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
+        # 直接使用 HTTP 引擎（纯 HTTP + curl_cffi Chrome 指纹）
+        r = await self.engine.api_call("POST", "/api/v2/chats/new", token, body)
+
         if r["status"] == 429:
             raise Exception("429 Too Many Requests (Engine Queue Full)")
 
@@ -83,23 +67,7 @@ class QwenClient:
             raise Exception(f"create_chat parse error: {e}, body={body_text[:200]}")
 
     async def delete_chat(self, token: str, chat_id: str):
-        if hasattr(self.engine, "browser_engine") and getattr(self.engine, "browser_engine") is not None:
-            r = await self.engine.browser_engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
-            status = r.get("status")
-            body_text = (r.get("body") or "").lower()
-            should_fallback = (
-                status == 0
-                or status in (401, 403, 429)
-                or "waf" in body_text
-                or "<!doctype" in body_text
-                or "forbidden" in body_text
-                or "unauthorized" in body_text
-            )
-            if should_fallback:
-                preview = (r.get("body") or "")[:160].replace("\n", "\\n")
-                log.warning(f"[QwenClient] delete_chat 浏览器失败，回退到默认引擎 chat_id={chat_id} status={status} body_preview={preview!r}")
-                await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
-            return
+        # 直接使用 HTTP 引擎删除会话
         await self.engine.api_call("DELETE", f"/api/v2/chats/{chat_id}", token)
 
     async def verify_token(self, token: str) -> bool:
@@ -136,11 +104,10 @@ class QwenClient:
                 return data.get("role") == "user"
             except Exception as e:
                 log.warning(f"[verify_token] JSON parse error (可能是被拦截或代理异常): {e}, status={resp.status_code}, text={resp.text[:100]}")
-                # 如果遇到阿里云 WAF 拦截，通常是因为 httpx 直接请求被墙，或者 token 本身就是正常的。
-                # 由于这是为了快速验证，如果被 WAF 拦截 (HTML)，我们姑且假定它是活着的，交给后面的浏览器引擎去真实处理
+                # 如果遇到阿里云 WAF 拦截或返回 HTML，通常是网络问题
                 if "aliyun_waf" in resp.text.lower() or "<!doctype" in resp.text.lower():
-                    log.info(f"[verify_token] 遇到 WAF 拦截页面，放行交给底层无头浏览器引擎处理。")
-                    return True
+                    log.warning(f"[verify_token] 检测到 WAF 或网络异常，返回 False")
+                    return False
                 return False
         except Exception as e:
             log.warning(f"[verify_token] HTTP error: {e}")

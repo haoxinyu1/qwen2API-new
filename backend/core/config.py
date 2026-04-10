@@ -2,7 +2,6 @@ import os
 import json
 from pathlib import Path
 from pydantic_settings import BaseSettings
-from typing import Dict, Set
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
 DATA_DIR = BASE_DIR / "data"
@@ -14,12 +13,12 @@ class Settings(BaseSettings):
     ADMIN_KEY: str = os.getenv("ADMIN_KEY", "admin")
     REGISTER_SECRET: str = os.getenv("REGISTER_SECRET", "")
 
-    # 引擎模式：httpx（快速直连）、browser（浏览器指纹，防封）或 hybrid（混合）
-    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "hybrid")
+    # 引擎模式：httpx（快速直连，Chrome 指纹伪装）
+    ENGINE_MODE: str = os.getenv("ENGINE_MODE", "httpx")
     NATIVE_TOOL_PASSTHROUGH: bool = os.getenv("NATIVE_TOOL_PASSTHROUGH", "true").lower() in ("1", "true", "yes", "on")
-    # 浏览器引擎配置
-    BROWSER_POOL_SIZE: int = int(os.getenv("BROWSER_POOL_SIZE", 2))
-    MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 1))
+    # HTTP 引擎配置
+    HTTPX_TIMEOUT: int = int(os.getenv("HTTPX_TIMEOUT", "30"))
+    MAX_INFLIGHT_PER_ACCOUNT: int = int(os.getenv("MAX_INFLIGHT", 2))
     STREAM_KEEPALIVE_INTERVAL: int = int(os.getenv("STREAM_KEEPALIVE_INTERVAL", 5))
 
     # 容灾与限流

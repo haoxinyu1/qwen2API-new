@@ -27,49 +27,19 @@ class UserCreate(BaseModel):
 @router.get("/status", dependencies=[Depends(verify_admin)])
 async def get_system_status(request: Request):
     pool = request.app.state.account_pool
-    engine = getattr(request.app.state, "gateway_engine", request.app.state.browser_engine)
-    browser_engine = getattr(request.app.state, "browser_engine", None)
-    httpx_engine = getattr(request.app.state, "httpx_engine", None)
+    engine = request.app.state.gateway_engine
 
-    if hasattr(engine, "status"):
-        engine_info = engine.status()
-    elif hasattr(engine, "_pages") and hasattr(engine, "pool_size"):
-        free_pages = engine._pages.qsize()
-        in_use = engine.pool_size - free_pages
-        engine_info = {
-            "started": engine._started,
-            "mode": "browser",
-            "pool_size": engine.pool_size,
-            "free_pages": free_pages,
-            "queue": in_use if in_use > 0 else 0,
-        }
-    else:
-        engine_info = {
-            "started": getattr(engine, "_started", False),
-            "mode": "httpx",
-            "pool_size": 0,
-            "free_pages": 0,
-            "queue": 0,
-        }
-
-    browser_info = {
-        "started": getattr(browser_engine, "_started", False),
-        "pool_size": getattr(browser_engine, "pool_size", 0),
-        "free_pages": browser_engine._pages.qsize() if getattr(browser_engine, "_pages", None) is not None else 0,
-        "queue": max(0, getattr(browser_engine, "pool_size", 0) - (browser_engine._pages.qsize() if getattr(browser_engine, "_pages", None) is not None else 0)),
-    } if browser_engine else {"started": False, "pool_size": 0, "free_pages": 0, "queue": 0}
-
-    httpx_info = {
-        "started": getattr(httpx_engine, "_started", False),
+    # HttpxEngine 状态信息
+    engine_info = {
+        "started": getattr(engine, "_started", False),
         "mode": "httpx",
-    } if httpx_engine else {"started": False, "mode": "httpx"}
+        "type": engine.__class__.__name__,
+    }
 
     return {
         "accounts": pool.status(),
         "engine_mode": settings.ENGINE_MODE,
-        "browser_engine": browser_info,
-        "httpx_engine": httpx_info,
-        "hybrid_engine": engine_info if settings.ENGINE_MODE == "hybrid" else None,
+        "engine": engine_info,
     }
 
 
