@@ -260,8 +260,14 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list) -> 
             first_line = f"Human: {first_short}"
             # Check if first user message is already at the start of history
             if not history_parts or not history_parts[0].startswith(f"Human: {first_text[:60]}"):
-                history_parts.insert(0, first_line)
-                log.debug(f"[Prompt] 补回原始任务消息，确保上下文完整 ({len(first_short)}字)")
+                first_line_cost = len(first_line) + 2
+                if first_line_cost <= budget:
+                    while history_parts and used + first_line_cost > budget:
+                        removed = history_parts.pop()
+                        used -= len(removed) + 2
+                    history_parts.insert(0, first_line)
+                    used += first_line_cost
+                    log.debug(f"[Prompt] 补回原始任务消息，确保上下文完整 ({len(first_short)}字)")
 
     latest_user_line = ""
     if tools and messages:

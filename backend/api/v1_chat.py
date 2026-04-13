@@ -16,7 +16,7 @@ from backend.services.prompt_builder import messages_to_prompt
 from backend.services.response_formatters import build_openai_completion_payload
 from backend.services.qwen_client import QwenClient
 from backend.toolcall.normalize import build_tool_name_registry
-from backend.runtime.execution import retryable_usage_delta
+from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, retryable_usage_delta
 
 log = logging.getLogger("qwen2api.chat")
 router = APIRouter()
@@ -94,6 +94,10 @@ async def chat_completions(request: Request):
                         completion_id=completion_id,
                         created=created,
                         model_name=model_name,
+                        build_final_directive=lambda answer_text: build_tool_directive(
+                            standard_request,
+                            RuntimeAttemptState(answer_text=answer_text),
+                        ),
                     )
 
                     async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
@@ -114,22 +118,7 @@ async def chat_completions(request: Request):
                         on_delta=delta_handler,
                     )
                     execution = result.execution
-                    directive_payload = build_openai_completion_payload(
-                        completion_id=completion_id,
-                        created=created,
-                        model_name=model_name,
-                        prompt=prompt,
-                        execution=execution,
-                        standard_request=standard_request,
-                    )
-                    if directive_payload["choices"][0]["finish_reason"] == "tool_calls" and not execution.state.tool_calls:
-                        for tool_call in directive_payload["choices"][0]["message"].get("tool_calls", []):
-                            translator.on_delta({}, None, [{
-                                "id": tool_call["id"],
-                                "name": tool_call["function"]["name"],
-                                "input": json.loads(tool_call["function"]["arguments"]),
-                            }])
-                    final_finish_reason = directive_payload["choices"][0]["finish_reason"] if directive_payload["choices"][0]["finish_reason"] == "tool_calls" else execution.state.finish_reason
+                    final_finish_reason = "tool_calls" if execution.state.tool_calls else execution.state.finish_reason
                     for chunk in translator.finalize(final_finish_reason):
                         yield chunk
                     return
