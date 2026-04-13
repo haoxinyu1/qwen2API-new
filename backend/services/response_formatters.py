@@ -24,8 +24,25 @@ def build_openai_completion_payload(*, completion_id: str, created: int, model_n
         msg: dict[str, Any] = {"role": "assistant", "content": None, "tool_calls": oai_tool_calls}
         finish_reason = "tool_calls"
     else:
+        oai_tool_calls = []
         msg = {"role": "assistant", "content": execution.state.answer_text}
         finish_reason = "stop"
+
+    log_payload = [
+        {
+            "id": call["id"],
+            "name": call["function"]["name"],
+            "arguments": call["function"]["arguments"],
+        }
+        for call in oai_tool_calls
+    ]
+    import logging
+    logging.getLogger("qwen2api.chat").info(
+        "[OAI] response finish_reason=%s tool_calls=%s text_preview=%r",
+        finish_reason,
+        log_payload,
+        execution.state.answer_text[:300],
+    )
 
     return {
         "id": completion_id,

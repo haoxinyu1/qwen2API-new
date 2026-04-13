@@ -29,6 +29,7 @@ def _build_standard_request(req_data: dict) -> StandardRequest:
     prompt = prompt_result.prompt
     tools = prompt_result.tools
     tool_names = [tool_name for tool_name in (tool.get("name") for tool in tools) if isinstance(tool_name, str) and tool_name]
+    log.info("[OAI] normalized tools=%s", tool_names)
     return StandardRequest(
         prompt=prompt,
         response_model=requested_model,

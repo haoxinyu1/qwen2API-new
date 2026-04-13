@@ -5,7 +5,7 @@ import uuid
 from typing import Any, cast
 
 from backend.core.request_logging import get_request_context
-from backend.toolcall.normalize import normalize_tool_name
+from backend.toolcall.normalize import build_tool_name_registry, normalize_tool_name
 from backend.toolcall.parser import parse_tool_calls_detailed
 
 __all__ = ["parse_tool_calls", "parse_tool_calls_detailed", "inject_format_reminder", "parse_tool_calls_silent"]
@@ -127,6 +127,7 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
     if not tools:
         return [{"type": "text", "text": answer}], "end_turn"
     tool_names = {t.get("name") for t in tools if t.get("name")}
+    tool_registry = build_tool_name_registry(tool_names)
 
     def _log_debug(message: str) -> None:
         if emit_logs:
@@ -143,23 +144,25 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
     _log_debug(f"[ToolParse] [{req_tag}] 原始回复({len(answer)}字): {answer[:200]!r}")
 
     def _make_tool_block(name, input_data, prefix=""):
-        normalized_name = normalize_tool_name(name, tool_names)
-        if normalized_name not in tool_names:
-            _log_warning(f"[ToolParse] 工具名不匹配，回退为普通文本: name={name!r}, normalized={normalized_name!r}, tools={tool_names}")
+        normalized_name = normalize_tool_name(name, tool_registry.values())
+        cased_name = _normalize_tool_name_case(normalized_name, tool_names)
+        if cased_name not in tool_names:
+            _log_warning(f"[ToolParse] 工具名不匹配，回退为普通文本: name={name!r}, normalized={normalized_name!r}, cased={cased_name!r}, tools={tool_names}")
             return [{"type": "text", "text": answer}], "end_turn"
-        coerced_input = _coerce_tool_input(normalized_name, input_data, tools)
+        coerced_input = _coerce_tool_input(cased_name, input_data, tools)
         tool_id = f"toolu_{uuid.uuid4().hex[:8]}"
         blocks = []
         if prefix:
             blocks.append({"type": "text", "text": prefix})
-        blocks.append({"type": "tool_use", "id": tool_id, "name": normalized_name, "input": coerced_input})
+        blocks.append({"type": "tool_use", "id": tool_id, "name": cased_name, "input": coerced_input})
+        _log_info(f"[ToolParse] 返回工具块: original={name!r}, normalized={normalized_name!r}, final={cased_name!r}, input={json.dumps(coerced_input, ensure_ascii=False)[:200]}")
         return blocks, "tool_use"
 
     detailed = parse_tool_calls_detailed(answer, tool_names)
     detailed_calls = cast(list[dict[str, Any]], detailed["calls"])
     if detailed_calls:
         first_call = detailed_calls[0]
-        _log_info(f"[ToolParse] ✓ 详细解析格式: source={detailed['source']}, name={first_call['name']!r}")
+        _log_info(f"[ToolParse] ✓ 详细解析格式: source={detailed['source']}, name={first_call['name']!r}, input={json.dumps(first_call['input'], ensure_ascii=False)[:200]}")
         return _make_tool_block(first_call["name"], first_call["input"])
 
     tc_m = re.search(r'##TOOL_CALL##\s*(.*?)\s*##END_CALL##', answer, re.DOTALL | re.IGNORECASE)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -13,6 +14,8 @@ from backend.runtime.stream_metrics import StreamMetrics
 from backend.services import tool_parser
 from backend.toolcall.normalize import normalize_tool_name
 from backend.toolcall.stream_state import StreamingToolCallState
+
+log = logging.getLogger("qwen2api.runtime")
 
 
 @dataclass(slots=True)
@@ -329,6 +332,14 @@ async def collect_completion_run(
         emitted_visible_output=emitted_visible_output,
         stage_metrics=metrics.summary(),
     )
+    if request.tools:
+        log.info(
+            "[Runtime] finish=%s native_tool_calls=%s blocked=%s answer_preview=%r",
+            state.finish_reason,
+            native_tool_calls,
+            state.blocked_tool_names,
+            answer_text[:300],
+        )
     return RuntimeExecutionResult(state=state, chat_id=chat_id, acc=acc)
 
 
@@ -358,7 +369,19 @@ def build_tool_directive(
     request: StandardRequest,
     state: RuntimeAttemptState,
 ) -> RuntimeToolDirective:
-    return parse_tool_directive_once(request, state)
+    directive = parse_tool_directive_once(request, state)
+    if request.tools:
+        preview = [
+            {
+                "type": block.get("type"),
+                "id": block.get("id"),
+                "name": block.get("name"),
+                "input": block.get("input"),
+            }
+            for block in directive.tool_blocks[:3]
+        ]
+        log.info("[Runtime] directive stop_reason=%s blocks=%s", directive.stop_reason, preview)
+    return directive
 
 
 def anthropic_stream_usage_delta(prompt: str, answer_text: str) -> int:
