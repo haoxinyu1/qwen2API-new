@@ -35,6 +35,7 @@ def _build_standard_request(req_data: dict) -> StandardRequest:
         response_model=model_name,
         resolved_model=resolve_model(model_name),
         surface="anthropic",
+        client_profile=CLAUDE_CODE_OPENAI_PROFILE,
         stream=req_data.get("stream", False),
         tools=tools,
         tool_names=tool_names,

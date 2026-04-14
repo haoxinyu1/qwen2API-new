@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
-from backend.adapter.standard_request import StandardRequest
+from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import update_request_context
 from backend.runtime.stream_metrics import StreamMetrics
@@ -313,6 +313,7 @@ async def collect_completion_run(
     native_tool_calls: list[dict[str, Any]] = []
     tool_state = StreamingToolCallState()
     emitted_visible_output = False
+    first_event_marked = False
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
 
@@ -342,8 +343,9 @@ async def collect_completion_run(
         if phase in ("think", "thinking_summary") and content:
             reasoning_fragments.append(content)
             emitted_visible_output = True
-            if "first_event" not in metrics.summary():
+            if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
+                first_event_marked = True
             if on_delta is not None:
                 await on_delta(evt, content, None)
             continue
@@ -351,16 +353,18 @@ async def collect_completion_run(
         if phase == "answer" and content:
             answer_fragments.append(content)
             emitted_visible_output = True
-            if "first_event" not in metrics.summary():
+            if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
+                first_event_marked = True
             if on_delta is not None:
                 await on_delta(evt, content, None)
             continue
 
         if phase == "tool_call":
             emitted_visible_output = True
-            if "first_event" not in metrics.summary():
+            if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
+                first_event_marked = True
             completed_calls = tool_state.process_event(evt)
             if completed_calls:
                 native_tool_calls.extend(completed_calls)
@@ -494,7 +498,11 @@ def evaluate_retry_directive(
         blocked_name = normalize_tool_name(state.blocked_tool_names[0], request.tool_names)
         return RuntimeRetryDirective(
             retry=True,
-            next_prompt=tool_parser.inject_format_reminder(current_prompt, blocked_name),
+            next_prompt=tool_parser.inject_format_reminder(
+                current_prompt,
+                blocked_name,
+                client_profile=getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE),
+            ),
         )
 
     if request.tools and state.answer_text:

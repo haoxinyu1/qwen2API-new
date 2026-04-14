@@ -4,6 +4,7 @@ import re
 import uuid
 from typing import Any, cast
 
+from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
 from backend.core.request_logging import get_request_context
 from backend.toolcall.normalize import build_tool_name_registry, normalize_tool_name
 from backend.toolcall.parser import parse_tool_calls_detailed
@@ -302,19 +303,26 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
     return [{"type": "text", "text": answer}], "end_turn"
 
 
-def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str = "openclaw_openai") -> str:
+def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
     """Inject a format correction reminder into the prompt before the final 'Assistant:' tag.
     Used when Qwen server returns 'Tool X does not exists.' (native call was intercepted)."""
-    del client_profile
-    reminder = (
-        f"[CORRECTION]: You called '{tool_name}' using the WRONG format — "
-        f"the server BLOCKED it with 'Tool {tool_name} does not exists.'. "
-        f"You MUST use ##TOOL_CALL## format and NOTHING ELSE:\n"
-        f"##TOOL_CALL##\n"
-        f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
-        f"##END_CALL##\n"
-        f"DO NOT use JSON without delimiters. DO NOT use any XML tags. ONLY ##TOOL_CALL##.\n"
-    )
+    if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
+        reminder = (
+            f"[CORRECTION]: You called '{tool_name}' using the wrong tool-call format, and the server rejected it with "
+            f"'Tool {tool_name} does not exists.'. Reissue the tool call as a single valid JSON object only:\n"
+            f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
+            "Do not wrap it in ##TOOL_CALL## blocks. Do not use XML tags. Do not add explanation text before or after the JSON.\n"
+        )
+    else:
+        reminder = (
+            f"[CORRECTION]: You called '{tool_name}' using the WRONG format — "
+            f"the server BLOCKED it with 'Tool {tool_name} does not exists.'. "
+            f"You MUST use ##TOOL_CALL## format and NOTHING ELSE:\n"
+            f"##TOOL_CALL##\n"
+            f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
+            f"##END_CALL##\n"
+            f"DO NOT use JSON without delimiters. DO NOT use any XML tags. ONLY ##TOOL_CALL##.\n"
+        )
     prompt = prompt.rstrip()
     if prompt.endswith("Assistant:"):
         return prompt[: -len("Assistant:")] + reminder + "\nAssistant:"

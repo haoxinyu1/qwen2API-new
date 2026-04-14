@@ -5,6 +5,9 @@ from typing import Any
 
 from backend.runtime.attachment_types import NormalizedAttachment
 
+CLAUDE_CODE_OPENAI_PROFILE = "claude_code_openai"
+OPENCLAW_OPENAI_PROFILE = "openclaw_openai"
+
 
 @dataclass(slots=True)
 class StandardRequest:
@@ -12,7 +15,7 @@ class StandardRequest:
     response_model: str
     resolved_model: str
     surface: str
-    client_profile: str = "openclaw_openai"
+    client_profile: str = OPENCLAW_OPENAI_PROFILE
     requested_model: str | None = None
     content: str | None = None
     stream: bool = False

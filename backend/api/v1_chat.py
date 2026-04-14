@@ -57,12 +57,13 @@ async def chat_completions(request: Request):
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
     client_profile = _detect_openai_client_profile(request, req_data)
-    standard_request = _build_standard_request(req_data, client_profile=client_profile)
     file_store = getattr(app.state, "file_store", None)
+    preprocessed = None
     if file_store is not None:
         preprocessed = await preprocess_attachments(req_data, file_store)
         req_data = preprocessed.payload
-        standard_request = _build_standard_request(req_data, client_profile=client_profile)
+    standard_request = _build_standard_request(req_data, client_profile=client_profile)
+    if preprocessed is not None:
         standard_request.attachments = preprocessed.attachments
         standard_request.uploaded_file_ids = preprocessed.uploaded_file_ids
     model_name = standard_request.response_model

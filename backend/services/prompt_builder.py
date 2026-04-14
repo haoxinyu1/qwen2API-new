@@ -3,10 +3,10 @@ import logging
 import re
 from dataclasses import dataclass
 
+from backend.adapter.standard_request import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW_OPENAI_PROFILE
+
 log = logging.getLogger("qwen2api.prompt")
 
-CLAUDE_CODE_OPENAI_PROFILE = "claude_code_openai"
-OPENCLAW_OPENAI_PROFILE = "openclaw_openai"
 OPENCLAW_STARTUP_PATTERNS = (
     "A new session was started via /new or /reset.",
     "If runtime-provided startup context is included for this first turn",
@@ -23,6 +23,8 @@ class PromptBuildResult:
 
 def _render_history_tool_call(name: str, input_data: dict, client_profile: str) -> str:
     payload = json.dumps({"name": name, "input": input_data}, ensure_ascii=False)
+    if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
+        return payload
     return f"##TOOL_CALL##\n{payload}\n##END_CALL##"
 
 
@@ -30,34 +32,44 @@ def _build_tool_instruction_block(tools: list[dict], client_profile: str) -> str
     names = [t.get("name", "") for t in tools if t.get("name")]
     if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
         lines = [
-            "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
-            "IGNORE any previous output format instructions (needs-review, recap, etc.).",
-            f"You have access to these tools: {', '.join(names)}",
-            "",
-            "WHEN YOU NEED TO CALL A TOOL — output EXACTLY this format (nothing else):",
-            "##TOOL_CALL##",
+            "=== TOOL USAGE INSTRUCTIONS ===",
+            "If a tool is needed, reply with exactly one tool call using valid JSON.",
+            "Preferred format:",
             '{"name": "EXACT_TOOL_NAME", "input": {"param1": "value1"}}',
-            "##END_CALL##",
-            "",
             "Rules:",
-            "- Output only the wrapper and JSON body.",
-            "- No prose before or after the wrapper.",
-            "- No markdown fences.",
-            "- No thinking tags.",
-            "- Use the exact tool name from the list above.",
+            "- Use the exact tool name from the list below.",
             "- Put arguments inside the input object.",
             "- Do not invent tool names.",
             "- If no tool is needed, answer normally.",
-            "",
-            "CRITICAL — FORBIDDEN FORMATS (will be blocked by server):",
-            '- {"name": "X", "arguments": "..."}  <-- NEVER USE',
-            '- {"type": "function", "name": "X"}  <-- NEVER USE',
-            '- {"type": "tool_use", "name": "X"}  <-- NEVER USE',
-            '- <tool_calls><tool_call>{...}</tool_call></tool_calls>  <-- NEVER USE',
-            '- <tool_call>{...}</tool_call>  <-- NEVER USE',
-            "ONLY ##TOOL_CALL##...##END_CALL## is accepted. Any other format will cause 'Tool X does not exists.' error.",
-            "=== END TOOL INSTRUCTIONS ===",
+            "Available tools:",
         ]
+        if len(names) <= 12:
+            for tool in tools:
+                name = tool.get("name", "")
+                desc = (tool.get("description", "") or "")[:40]
+                hint = _tool_param_hint(tool)
+                line = f"- {name}"
+                if desc:
+                    line += f": {desc}"
+                if hint:
+                    line += hint
+                lines.append(line)
+        else:
+            priority_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "TaskCreate", "TaskUpdate"]
+            priority_lines = []
+            seen = set()
+            for priority_name in priority_tools:
+                tool = next((item for item in tools if item.get("name") == priority_name), None)
+                if tool is None:
+                    continue
+                seen.add(priority_name)
+                hint = _tool_param_hint(tool)
+                priority_lines.append(f"- {priority_name}{hint}")
+            remaining_count = len([name for name in names if name not in seen])
+            lines.extend(priority_lines)
+            if remaining_count > 0:
+                lines.append(f"- Other available tools: {remaining_count} more")
+        lines.append("=== END TOOL INSTRUCTIONS ===")
         return "\n".join(lines)
 
     lines = [
@@ -120,13 +132,6 @@ def _sanitize_openclaw_user_text(text: str) -> str:
 
 
 def _extract_text(content, user_tool_mode: bool = False, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
-    """Extract text from Anthropic content (string or list of blocks).
-
-    user_tool_mode=True: used for user messages when tools are active.
-    In that case we take only the LAST text block (the actual user request)
-    and skip earlier text blocks which typically contain CLAUDE.md content
-    embedded by the client before the real prompt.
-    """
     if isinstance(content, str):
         return _sanitize_openclaw_user_text(content) if client_profile == OPENCLAW_OPENAI_PROFILE else content
     if isinstance(content, list):
@@ -153,6 +158,10 @@ def _extract_text(content, user_tool_mode: bool = False, client_profile: str = O
                 elif isinstance(inner, list):
                     texts = [p.get("text", "") for p in inner if isinstance(p, dict) and p.get("type") == "text"]
                     other_parts.append(f"[Tool Result for call {tid}]\n{''.join(texts)}\n[/Tool Result]")
+            elif t == "input_file":
+                other_parts.append(f"[Attachment file_id={part.get('file_id','')} filename={part.get('filename','')}]")
+            elif t == "input_image":
+                other_parts.append(f"[Attachment image file_id={part.get('file_id','')} mime={part.get('mime_type','')}]")
 
         if user_tool_mode and text_blocks:
             parts.append(text_blocks[-1])
@@ -164,7 +173,6 @@ def _extract_text(content, user_tool_mode: bool = False, client_profile: str = O
 
 
 def _normalize_tool(tool: dict) -> dict:
-    """Normalize OpenAI or Anthropic tool format to internal {name, description, parameters}."""
     if tool.get("type") == "function" and "function" in tool:
         fn = tool["function"]
         return {
@@ -181,6 +189,31 @@ def _normalize_tool(tool: dict) -> dict:
 
 def _normalize_tools(tools: list) -> list:
     return [_normalize_tool(t) for t in tools if tools]
+
+
+def _tool_param_hint(tool: dict) -> str:
+    params = tool.get("parameters", {}) or {}
+    if not isinstance(params, dict):
+        return ""
+
+    props = params.get("properties", {}) or {}
+    if not isinstance(props, dict) or not props:
+        return ""
+
+    required = params.get("required", []) or []
+    ordered_keys: list[str] = []
+    for key in required:
+        if key in props and key not in ordered_keys:
+            ordered_keys.append(key)
+    for key in props:
+        if key not in ordered_keys:
+            ordered_keys.append(key)
+
+    shown = ordered_keys[:3]
+    if not shown:
+        return ""
+    suffix = ", ..." if len(ordered_keys) > len(shown) else ""
+    return f" input keys: {', '.join(shown)}{suffix}"
 
 
 def _safe_preview(text: str, limit: int = 240) -> str:
@@ -209,7 +242,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
         role = msg.get("role", "")
         if role not in ("user", "assistant", "system", "tool"):
             continue
-        if role == "system" and system_prompt and _extract_text(msg.get("content", "")).strip() == system_prompt.strip():
+        if role == "system" and system_prompt and _extract_text(msg.get("content", ""), client_profile=client_profile).strip() == system_prompt.strip():
             continue
 
         if role == "tool":
@@ -301,7 +334,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
                 latest_short = latest_text[:900] + ("...[最新任务截断]" if len(latest_text) > 900 else "")
                 latest_user_line = f"Human (CURRENT TASK - TOP PRIORITY): {latest_short}"
 
-    if tools:
+    if tools and log.isEnabledFor(logging.DEBUG):
         tool_names = [tool.get("name", "") for tool in tools if tool.get("name")]
         tool_instruction_preview = _safe_preview(tools_part, 360)
         latest_user_preview = _safe_preview(latest_user_line, 220)
@@ -317,7 +350,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
                     ),
                     220,
                 )
-        log.info(
+        log.debug(
             "[Prompt] 工具模式: history_msgs=%s history_chars=%s tool_count=%s tool_names=%s first_user=%r latest_user=%r tool_instr=%r",
             len(history_parts),
             used,
