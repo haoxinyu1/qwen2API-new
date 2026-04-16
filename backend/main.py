@@ -15,6 +15,7 @@ from backend.core.database import AsyncJsonDB
 from backend.core.account_pool import AccountPool
 from backend.core.session_affinity import SessionAffinityStore
 from backend.core.upstream_file_cache import UpstreamFileCache
+from backend.core.session_lock import SessionLockRegistry
 from backend.core.request_logging import configure_logging, request_context
 from backend.services.qwen_client import QwenClient
 from backend.services.file_store import LocalFileStore
@@ -50,13 +51,14 @@ async def lifespan(app: FastAPI):
         app.state.upstream_file_cache = UpstreamFileCache(app.state.context_cache_db)
         app.state.context_offloader = ContextOffloader(settings)
         app.state.upstream_file_uploader = UpstreamFileUploader(app.state.qwen_client, settings)
+        app.state.session_locks = SessionLockRegistry()
 
         # 加载账号并启动后台清理任务
         await app.state.account_pool.load()
         await app.state.file_store.load()
         await app.state.session_affinity.load()
         await app.state.upstream_file_cache.load()
-        asyncio.create_task(garbage_collect_chats(app.state.qwen_client))
+        asyncio.create_task(garbage_collect_chats(app))
         asyncio.create_task(context_cleanup_loop(app))
 
     yield

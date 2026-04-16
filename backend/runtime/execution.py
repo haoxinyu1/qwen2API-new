@@ -48,6 +48,7 @@ class RuntimeToolDirective:
 class RuntimeRetryDirective:
     retry: bool
     next_prompt: str
+    reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -145,6 +146,8 @@ def should_force_finish_after_tool_use(stop_reason: str, trailing_idle_seconds: 
 
 def extract_blocked_tool_names(text: str, allowed_tool_names: list[str] | None = None) -> list[str]:
     if not text:
+        return []
+    if "does not exist" not in text.lower():
         return []
     blocked = re.findall(r"Tool\s+([A-Za-z0-9_.:-]+)\s+does not exists?\.?", text)
     if not blocked:
@@ -328,10 +331,12 @@ async def run_runtime_attempt(
         state=execution.state,
         allow_after_visible_output=allow_after_visible_output,
     )
+    preserve_chat = bool(getattr(request, 'persistent_session', False))
     continuation = await continue_after_retry_directive(
         client=client,
         execution=execution,
         retry=retry,
+        preserve_chat=preserve_chat,
     )
     return RuntimeAttemptOutcome(execution=execution, continuation=continuation)
 
@@ -355,27 +360,99 @@ async def collect_completion_run(
     raw_events: list[dict[str, Any]] = []
     metrics = StreamMetrics()
 
+    # 初始化 Tool Sieve 用于实时检测
+    tool_sieve = None
+    if request.tools:
+        tool_sieve = tool_parser.ToolSieve(request.tool_names)
+        log.info("[Collect] Tool Sieve 已启用，工具列表: %s", request.tool_names)
+
     def _finalize_result(*, reason: str | None = None) -> RuntimeExecutionResult:
         answer_text = "".join(answer_fragments)
         reasoning_text = "".join(reasoning_fragments)
         if native_tool_calls and not answer_text:
             answer_text = native_tool_calls_to_markup(native_tool_calls)
-        if reason:
-            log.info(
-                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s",
+
+        # 关键修复：强制解析最终文本中的工具调用
+        detected_tool_calls = native_tool_calls
+        final_finish_reason = "tool_calls" if native_tool_calls else "stop"
+
+        # 第一重：刷新 Tool Sieve
+        if tool_sieve and not native_tool_calls:
+            flush_events = tool_sieve.flush()
+            for evt in flush_events:
+                if evt.get("type") == "tool_calls":
+                    calls = evt.get("calls", [])
+                    if calls:
+                        # 转换为标准格式
+                        import uuid
+                        detected_tool_calls = [{
+                            "type": "tool_use",
+                            "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                            "name": call["name"],
+                            "input": call["input"]
+                        } for call in calls]
+                        final_finish_reason = "tool_calls"
+                        log.info(
+                            "[Collect] ✓ Tool Sieve 刷新检测到工具调用: tools=%s",
+                            [t.get("name") for t in detected_tool_calls],
+                        )
+                        break
+                elif evt.get("type") == "content":
+                    # 剩余文本内容
+                    pass
+
+        # 第二重：解析最终文本
+        if not detected_tool_calls and request.tools and answer_text:
+            # 尝试从最终文本中解析工具调用
+            tool_blocks, stop_reason = tool_parser.parse_tool_calls_silent(answer_text, request.tools)
+            tool_use_blocks = [b for b in tool_blocks if b.get("type") == "tool_use"]
+
+            if tool_use_blocks and stop_reason == "tool_use":
+                # 找到工具调用！
+                detected_tool_calls = tool_use_blocks
+                final_finish_reason = "tool_calls"
+
+                # 从文本中移除工具调用部分
+                text_blocks = [b for b in tool_blocks if b.get("type") == "text"]
+                if text_blocks:
+                    answer_text = text_blocks[0].get("text", "")
+                else:
+                    answer_text = ""
+
+                log.info(
+                    "[Collect] ✓ 最终文本解析检测到工具调用: tools=%s, cleaned_text_len=%s",
+                    [t.get("name") for t in detected_tool_calls],
+                    len(answer_text),
+                )
+
+        # 检查空输出
+        if not detected_tool_calls and not answer_text.strip() and not reasoning_text.strip():
+            log.warning(
+                "[Collect] 模型返回空输出: reason=%s chat_id=%s",
                 reason,
                 chat_id,
-                len(native_tool_calls),
+            )
+            # 如果有 reasoning 但没有 visible output，说明模型只输出了思考过程
+            if reasoning_text.strip():
+                log.warning("[Collect] 模型只返回了推理内容，没有可见输出")
+
+        if reason:
+            log.info(
+                "[Collect] finalize reason=%s chat_id=%s tool_calls=%s answer_chars=%s reasoning_chars=%s finish_reason=%s",
+                reason,
+                chat_id,
+                len(detected_tool_calls),
                 len(answer_text),
                 len(reasoning_text),
+                final_finish_reason,
             )
         metrics.mark("stream_finish", float(len(raw_events)))
         state = RuntimeAttemptState(
             answer_text=answer_text,
             reasoning_text=reasoning_text,
-            tool_calls=native_tool_calls,
+            tool_calls=detected_tool_calls,
             blocked_tool_names=extract_blocked_tool_names(answer_text.strip(), request.tool_names),
-            finish_reason="tool_calls" if native_tool_calls else "stop",
+            finish_reason=final_finish_reason,
             raw_events=raw_events,
             emitted_visible_output=emitted_visible_output,
             stage_metrics=metrics.summary(),
@@ -388,6 +465,7 @@ async def collect_completion_run(
         has_custom_tools=bool(request.tools),
         files=getattr(request, "upstream_files", None),
         fixed_account=getattr(request, "bound_account", None),
+        existing_chat_id=getattr(request, "upstream_chat_id", None),
     ):
         if item.get("type") == "meta":
             chat_id = item.get("chat_id")
@@ -423,19 +501,44 @@ async def collect_completion_run(
             if not first_event_marked:
                 metrics.mark("first_event", float(len(raw_events)))
                 first_event_marked = True
+
+            # Tool Sieve 实时检测
+            if tool_sieve:
+                sieve_events = tool_sieve.process_chunk(content)
+                for sieve_evt in sieve_events:
+                    if sieve_evt.get("type") == "tool_calls":
+                        # 检测到工具调用！
+                        calls = sieve_evt.get("calls", [])
+                        if calls:
+                            import uuid
+                            detected_calls = [{
+                                "type": "tool_use",
+                                "id": f"toolu_{uuid.uuid4().hex[:8]}",
+                                "name": call["name"],
+                                "input": call["input"]
+                            } for call in calls]
+                            native_tool_calls.extend(detected_calls)
+                            log.info(
+                                "[Collect] ✓ Tool Sieve 实时检测到工具调用: tools=%s",
+                                [c.get("name") for c in detected_calls],
+                            )
+                            return _finalize_result(reason="tool_sieve_detected")
+
             if on_delta is not None:
                 await on_delta(evt, content, None)
             if request.tools:
                 answer_text = "".join(answer_fragments)
-                blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
-                if blocked_tool_names:
-                    return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
-                directive = parse_tool_directive_once(
-                    request,
-                    RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
-                )
-                if directive.stop_reason == "tool_use":
-                    return _finalize_result(reason="textual_tool_use")
+                if len(answer_fragments) % 3 == 0 or "does not exist" in content.lower():
+                    blocked_tool_names = extract_blocked_tool_names(answer_text.strip(), request.tool_names)
+                    if blocked_tool_names:
+                        return _finalize_result(reason=f"blocked_tool_name:{blocked_tool_names[0]}")
+                if "##TOOL_CALL##" in answer_text or "<tool_call>" in answer_text:
+                    directive = parse_tool_directive_once(
+                        request,
+                        RuntimeAttemptState(answer_text=answer_text, reasoning_text="".join(reasoning_fragments)),
+                    )
+                    if directive.stop_reason == "tool_use":
+                        return _finalize_result(reason="textual_tool_use")
             continue
 
         if phase == "tool_call":
@@ -479,7 +582,12 @@ def build_tool_directive(
     request: StandardRequest,
     state: RuntimeAttemptState,
 ) -> RuntimeToolDirective:
-    return parse_tool_directive_once(request, state)
+    directive = parse_tool_directive_once(request, state)
+    log.info(
+        f"[ToolDirective] tool_blocks={len(directive.tool_blocks)} stop_reason={directive.stop_reason} "
+        f"has_tool_use={any(b.get('type') == 'tool_use' for b in directive.tool_blocks)}"
+    )
+    return directive
 
 
 def anthropic_stream_usage_delta(prompt: str, answer_text: str) -> int:
@@ -523,11 +631,11 @@ def inject_assistant_message(prompt: str, message: str) -> str:
 
 
 def retryable_usage_delta(prompt: str):
-    return lambda execution, _: len(execution.state.answer_text) + len(prompt)
+    return lambda execution, current_prompt=None: len(execution.state.answer_text) + len(current_prompt or prompt)
 
 
 def build_usage_delta_factory(prompt: str) -> Callable[[RuntimeExecutionResult, Any | None], int]:
-    return lambda execution, _=None: len(execution.state.answer_text) + len(prompt)
+    return lambda execution, current_prompt=None: len(execution.state.answer_text) + len(current_prompt or prompt)
 
 
 def request_max_attempts(request: StandardRequest) -> int:
@@ -537,45 +645,6 @@ def request_max_attempts(request: StandardRequest) -> int:
 def plan_runtime_attempts(request: StandardRequest, *, initial_prompt: str) -> RuntimeAttemptPlan:
     loop = build_retry_loop(request, initial_prompt=initial_prompt)
     return RuntimeAttemptPlan(loop=loop, prompt=loop.prompt)
-
-
-def inject_minimal_tool_retry_prompt(prompt: str, request: StandardRequest) -> str:
-    client_profile = getattr(request, "client_profile", CLAUDE_CODE_OPENAI_PROFILE)
-    if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
-        reminder = (
-            "[MANDATORY NEXT STEP]: Your last reply did not produce a usable tool call. "
-            "If a tool is needed, output exactly one minified JSON object and nothing else. "
-            "Example shape: {\"name\":\"TOOL_NAME\",\"input\":{...}}. "
-            "No prose. No markdown. No XML. No wrappers. If no tool is needed, answer normally."
-        )
-    else:
-        reminder = (
-            "[MANDATORY NEXT STEP]: Your last reply did not produce a usable tool call. "
-            "If a tool is needed, output exactly one ##TOOL_CALL## block and nothing else. "
-            "If no tool is needed, answer normally."
-        )
-    return inject_assistant_message(prompt, reminder)
-
-
-def should_retry_toolless_stream_end(request: StandardRequest, state: RuntimeAttemptState, directive: RuntimeToolDirective, current_prompt: str) -> bool:
-    if not request.tools:
-        return False
-    if directive.stop_reason == "tool_use":
-        return False
-    if state.tool_calls:
-        return False
-    answer = (state.answer_text or "").strip()
-    if not answer:
-        return False
-    if "[MANDATORY NEXT STEP]: Your last reply did not produce a usable tool call." in current_prompt:
-        return False
-    lowered = answer.lower()
-    drift_markers = (
-        "i need to", "i should", "let me", "first,", "first ", "next,",
-        "tool", "read", "write", "edit", "glob", "bash", "websearch", "webfetch",
-        "首先", "需要先", "我需要", "我先", "让我", "接下来",
-    )
-    return len(answer) >= 280 or any(marker in lowered for marker in drift_markers)
 
 
 def build_retry_loop(request: StandardRequest, *, initial_prompt: str) -> RuntimeRetryLoop:
@@ -596,7 +665,7 @@ def evaluate_retry_directive(
     allow_after_visible_output: bool = False,
 ) -> RuntimeRetryDirective:
     if attempt_index >= max_attempts - 1:
-        return RuntimeRetryDirective(retry=False, next_prompt=current_prompt)
+        return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
 
     can_retry_after_output = allow_after_visible_output or not state.emitted_visible_output
 
@@ -611,11 +680,11 @@ def evaluate_retry_directive(
             state.finish_reason,
             state.emitted_visible_output,
         )
-        return RuntimeRetryDirective(retry=True, next_prompt=next_prompt)
+        return RuntimeRetryDirective(retry=True, next_prompt=next_prompt, reason=reason)
 
     if state.blocked_tool_names and request.tools:
         if not can_retry_after_output:
-            return RuntimeRetryDirective(retry=False, next_prompt=current_prompt)
+            return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
         blocked_name = normalize_tool_name(state.blocked_tool_names[0], request.tool_names)
         return _retry(
             f"blocked_tool_name:{blocked_name}",
@@ -672,7 +741,11 @@ def evaluate_retry_directive(
                     ) >= 1
                 if repeated_same_tool and can_retry_after_output:
                     force_text = (
-                        f"[MANDATORY NEXT STEP]: You already called {first_tool.get('name')} with the same input. "
+                        f"[强制要求]: 你已经用相同参数调用了 {first_tool.get('name')}。"
+                        "不要重复相同的工具调用。"
+                        "使用已有的工具结果，选择下一个相关工具或完成任务。"
+                        "如果是配置文件任务，读取一次后直接编辑/写入文件，不要重复读取。"
+                        f"\n[MANDATORY]: You already called {first_tool.get('name')} with the same input. "
                         "Do NOT repeat the same tool call. "
                         "Use the tool result you already have and either choose the next relevant tool or finish the task. "
                         "If this is a config-file task, read once and then edit/write the file instead of rereading it."
@@ -685,17 +758,58 @@ def evaluate_retry_directive(
                 first_tool
                 and first_tool.get("name") == "Read"
                 and has_recent_unchanged_read_result(history_messages)
+            ):
+                if can_retry_after_output:
+                    force_text = (
+                        "[强制要求]: 你刚收到'Unchanged since last read'（文件未改变）。"
+                        "不要再次读取同一个文件。"
+                        "现在选择其他工具或完成任务。"
+                        "\n[MANDATORY]: You just received 'Unchanged since last read'. "
+                        "Do NOT call Read again. Choose another tool or finish the task."
+                    )
+                    return _retry(
+                        "unchanged_read_result",
+                        inject_assistant_message(current_prompt, force_text),
+                    )
+                else:
+                    log.warning(f"[Runtime] Blocked repeated Read after 'Unchanged since last read', but cannot retry")
+
+            # 防止自动调用Agent工具
+            if (
+                first_tool
+                and first_tool.get("name") == "Agent"
                 and can_retry_after_output
             ):
-                force_text = (
-                    "[MANDATORY NEXT STEP]: You just received 'Unchanged since last read'. "
-                    "Do NOT call Read again on the same target. "
-                    "Choose another tool now."
-                )
-                return _retry(
-                    "unchanged_read_result",
-                    inject_assistant_message(current_prompt, force_text),
-                )
+                # 检查用户消息中是否明确提到agent相关词汇
+                user_mentioned_agent = False
+                for msg in reversed(history_messages or []):
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            text = content.lower()
+                        elif isinstance(content, list):
+                            text = " ".join(
+                                part.get("text", "").lower()
+                                for part in content
+                                if isinstance(part, dict) and part.get("type") == "text"
+                            )
+                        else:
+                            text = ""
+                        if any(keyword in text for keyword in ["agent", "代理", "子任务", "subtask", "background"]):
+                            user_mentioned_agent = True
+                        break
+
+                if not user_mentioned_agent:
+                    force_text = (
+                        "[强制要求]: 不要自动调用Agent工具。用户没有要求使用代理或子任务。"
+                        "请直接完成用户的请求，使用Read/Write/Edit等工具。"
+                        "\n[MANDATORY]: Do NOT call Agent tool automatically. User did not request agent or subtask. "
+                        "Complete the user's request directly using Read/Write/Edit tools."
+                    )
+                    return _retry(
+                        "auto_agent_blocked",
+                        inject_assistant_message(current_prompt, force_text),
+                    )
 
             if (
                 first_tool
@@ -704,7 +818,10 @@ def evaluate_retry_directive(
                 and can_retry_after_output
             ):
                 force_text = (
-                    "[MANDATORY NEXT STEP]: The last WebSearch returned no results. "
+                    "[强制要求]: 上次WebSearch没有返回结果。"
+                    "不要用类似的词再次调用WebSearch。"
+                    "使用其他工具或用现有信息完成回答。"
+                    "\n[MANDATORY]: The last WebSearch returned no results. "
                     "Do NOT call WebSearch again with similar wording. "
                     "Use another tool or finish with the best available answer."
                 )
@@ -712,28 +829,26 @@ def evaluate_retry_directive(
                     "search_no_results",
                     inject_assistant_message(current_prompt, force_text),
                 )
-        elif can_retry_after_output and should_retry_toolless_stream_end(request, state, directive, current_prompt):
-            return _retry(
-                "toolless_stream_end",
-                inject_minimal_tool_retry_prompt(current_prompt, request),
-            )
 
-    return RuntimeRetryDirective(retry=False, next_prompt=current_prompt)
+    return RuntimeRetryDirective(retry=False, next_prompt=current_prompt, reason=None)
 
 
-async def continue_after_retry_directive(*, client, execution, retry: RuntimeRetryDirective) -> RuntimeRetryContinuation:
+async def continue_after_retry_directive(*, client, execution, retry: RuntimeRetryDirective, preserve_chat: bool = False) -> RuntimeRetryContinuation:
     if not retry.retry:
         return RuntimeRetryContinuation(should_continue=False, next_prompt=retry.next_prompt)
-    await cleanup_runtime_resources(client, execution.acc, execution.chat_id)
-    await asyncio.sleep(0.15)
+    await cleanup_runtime_resources(client, execution.acc, execution.chat_id, preserve_chat=preserve_chat)
+    if not preserve_chat:
+        await asyncio.sleep(0.15)
     return RuntimeRetryContinuation(should_continue=True, next_prompt=retry.next_prompt)
 
 
-async def cleanup_runtime_resources(client, acc, chat_id: str | None) -> None:
+async def cleanup_runtime_resources(client, acc, chat_id: str | None, *, preserve_chat: bool = False) -> None:
     if acc is None:
         return
     token = getattr(acc, "token", None)
     client.account_pool.release(acc)
+    if preserve_chat:
+        return
     if chat_id and token:
         async def _delete_chat_later() -> None:
             try:

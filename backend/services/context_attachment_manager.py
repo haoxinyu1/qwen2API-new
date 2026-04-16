@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from backend.core.upstream_file_cache import UpstreamFileCacheEntry
-from backend.services.context_offload import SYSTEM_CONTEXT_FILE_PREFIX
+from backend.services.context_offload import SYSTEM_CONTEXT_FILE_PREFIX, SYSTEM_CONTEXT_PROMPT_NOTE
 
 
 def derive_session_key(surface: str, auth_token: str, payload: dict[str, Any]) -> str:
@@ -35,11 +35,12 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
     messages = payload.get("messages", []) or []
     manual_attachments = list(existing_attachments or [])
     plan = context_offloader.plan(messages, tools=tools, client_profile=client_profile)
-    if plan.mode == "inline" and not manual_attachments:
+    use_generated_context_files = bool(plan.generated_files) and not bool(tools)
+    if not use_generated_context_files and not manual_attachments:
         return {
             "payload": payload,
             "session_key": session_key,
-            "context_mode": plan.mode,
+            "context_mode": "inline",
             "upstream_files": list(payload.get("upstream_files", []) or []),
             "bound_account": None,
             "bound_account_email": None,
@@ -92,34 +93,35 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
             await affinity.add_uploaded_file(session_key, remote)
             await file_store.delete_path(attachment.local_path)
 
-        for index, generated in enumerate(plan.generated_files, 1):
-            fixed_base = f"{SYSTEM_CONTEXT_FILE_PREFIX}_{index}" if len(plan.generated_files) > 1 else SYSTEM_CONTEXT_FILE_PREFIX
-            filename = f"{fixed_base}.{generated.ext}"
-            local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
-            cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], generated.ext)
-            if cache_entry is not None:
-                remote = cache_entry.remote_file_meta
-            else:
-                remote = await uploader.upload_local_file(acc, local_meta)
-                await cache.set(UpstreamFileCacheEntry(
-                    session_key=session_key,
-                    account_email=acc.email,
-                    sha256=local_meta["sha256"],
-                    ext=generated.ext,
-                    filename=filename,
-                    remote_file_meta=remote,
-                    created_at=local_meta["created_at"],
-                    expires_at=local_meta["created_at"] + context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS,
-                ))
-            upstream_files.append(remote["remote_ref"])
-            await affinity.add_uploaded_file(session_key, remote)
-            await file_store.delete_path(local_meta["path"])
-            local_file_records.append(local_meta)
+        if use_generated_context_files:
+            for index, generated in enumerate(plan.generated_files, 1):
+                fixed_base = f"{SYSTEM_CONTEXT_FILE_PREFIX}_{index}" if len(plan.generated_files) > 1 else SYSTEM_CONTEXT_FILE_PREFIX
+                filename = f"{fixed_base}.{generated.ext}"
+                local_meta = await file_store.save_text(filename, generated.text, generated.content_type, purpose="context")
+                cache_entry = await cache.get(session_key, acc.email, local_meta["sha256"], generated.ext)
+                if cache_entry is not None:
+                    remote = cache_entry.remote_file_meta
+                else:
+                    remote = await uploader.upload_local_file(acc, local_meta)
+                    await cache.set(UpstreamFileCacheEntry(
+                        session_key=session_key,
+                        account_email=acc.email,
+                        sha256=local_meta["sha256"],
+                        ext=generated.ext,
+                        filename=filename,
+                        remote_file_meta=remote,
+                        created_at=local_meta["created_at"],
+                        expires_at=local_meta["created_at"] + context_offloader.settings.CONTEXT_ATTACHMENT_TTL_SECONDS,
+                    ))
+                upstream_files.append(remote["remote_ref"])
+                await affinity.add_uploaded_file(session_key, remote)
+                await file_store.delete_path(local_meta["path"])
+                local_file_records.append(local_meta)
     except Exception:
         account_pool.release(acc)
         fallback_payload = dict(payload)
         summary_parts: list[str] = []
-        if plan.summary_text:
+        if use_generated_context_files and plan.summary_text:
             summary_parts.append(plan.summary_text[:1200])
         if manual_attachments:
             names = ", ".join(att.filename for att in manual_attachments[:4])
@@ -141,11 +143,11 @@ async def prepare_context_attachments(*, app, payload: dict[str, Any], surface: 
         }
 
     rewritten = dict(payload)
-    rewritten["messages"] = plan.inline_messages
+    rewritten["messages"] = plan.inline_messages if use_generated_context_files else messages
     return {
         "payload": rewritten,
         "session_key": session_key,
-        "context_mode": plan.mode,
+        "context_mode": plan.mode if use_generated_context_files else "inline",
         "upstream_files": upstream_files,
         "bound_account": acc,
         "bound_account_email": acc.email,

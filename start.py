@@ -134,6 +134,7 @@ def start_backend() -> subprocess.Popen:
     env["PYTHONUTF8"] = "1"
 
     port = env.get("PORT", "7860")
+    workers = env.get("WORKERS", "1")
     kill_port(int(port))
 
     proc = subprocess.Popen(
@@ -142,7 +143,7 @@ def start_backend() -> subprocess.Popen:
             "backend.main:app",
             "--host", "0.0.0.0",
             "--port", port,
-            "--workers", "1",
+            "--workers", workers,
         ],
         cwd=WORKSPACE_DIR,
         env=env,

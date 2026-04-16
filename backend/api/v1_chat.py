@@ -9,7 +9,7 @@ from backend.adapter.standard_request import StandardRequest
 from backend.core.config import settings
 from backend.core.request_logging import new_request_id, request_context, update_request_context
 from backend.services.attachment_preprocessor import preprocess_attachments
-from backend.services.context_attachment_manager import prepare_context_attachments
+from backend.services.context_attachment_manager import prepare_context_attachments, derive_session_key
 from backend.services.auth_quota import resolve_auth_context
 from backend.services.completion_bridge import run_retryable_completion_bridge
 from backend.services.openai_stream_translator import OpenAIStreamTranslator
@@ -17,6 +17,13 @@ from backend.services.prompt_builder import CLAUDE_CODE_OPENAI_PROFILE, OPENCLAW
 from backend.services.response_formatters import build_openai_completion_payload
 from backend.services.qwen_client import QwenClient
 from backend.services.standard_request_builder import build_chat_standard_request
+from backend.services.task_session import (
+    build_openai_assistant_history_message,
+    clear_invalidated_session_chat,
+    log_session_plan_reuse_cancelled,
+    persist_session_turn,
+    plan_persistent_session_turn,
+)
 from backend.runtime.execution import RuntimeAttemptState, build_tool_directive, build_usage_delta_factory, request_max_attempts
 
 log = logging.getLogger("qwen2api.chat")
@@ -58,6 +65,7 @@ async def chat_completions(request: Request):
         raise HTTPException(400, {"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}})
 
     client_profile = _detect_openai_client_profile(request, req_data)
+    session_key = derive_session_key("openai", token, req_data)
     original_history_messages = req_data.get("messages", [])
     file_store = getattr(app.state, "file_store", None)
     preprocessed = None
@@ -75,6 +83,29 @@ async def chat_completions(request: Request):
     standard_request.context_mode = context_prepared["context_mode"]
     standard_request.bound_account_email = context_prepared["bound_account_email"]
     standard_request.bound_account = context_prepared["bound_account"]
+
+    session_plan = await plan_persistent_session_turn(app=app, request=standard_request, payload=req_data, surface="openai")
+    if session_plan.enabled:
+        standard_request.persistent_session = True
+        standard_request.full_prompt = session_plan.full_prompt
+        standard_request.prompt = session_plan.prompt
+        standard_request.session_message_hashes = session_plan.current_hashes
+        standard_request.upstream_chat_id = session_plan.existing_chat_id if session_plan.reuse_chat else None
+        if standard_request.bound_account is None and session_plan.account_email:
+            standard_request.bound_account = await app.state.account_pool.acquire_wait_preferred(session_plan.account_email, timeout=60)
+            if standard_request.bound_account is not None:
+                standard_request.bound_account_email = standard_request.bound_account.email
+        elif standard_request.bound_account is not None and not standard_request.bound_account_email:
+            standard_request.bound_account_email = standard_request.bound_account.email
+        if standard_request.upstream_chat_id and standard_request.bound_account is None:
+            log_session_plan_reuse_cancelled(
+                request=standard_request,
+                planned_chat_id=session_plan.existing_chat_id,
+                reason="missing_bound_account",
+            )
+            standard_request.upstream_chat_id = None
+            standard_request.prompt = standard_request.full_prompt or standard_request.prompt
+
     model_name = standard_request.response_model
     qwen_model = standard_request.resolved_model
     prompt = standard_request.prompt
@@ -98,49 +129,63 @@ async def chat_completions(request: Request):
 
         if standard_request.stream:
             async def generate():
-                try:
-                    update_request_context(stream_attempt=1)
-                    translator = OpenAIStreamTranslator(
-                        completion_id=completion_id,
-                        created=created,
-                        model_name=model_name,
-                        client_profile=standard_request.client_profile,
-                        build_final_directive=lambda answer_text: build_tool_directive(
-                            standard_request,
-                            RuntimeAttemptState(answer_text=answer_text),
-                        ),
-                        allowed_tool_names=standard_request.tool_names,
-                    )
+                async with app.state.session_locks.hold(session_key):
+                    try:
+                        update_request_context(stream_attempt=1)
+                        translator = OpenAIStreamTranslator(
+                            completion_id=completion_id,
+                            created=created,
+                            model_name=model_name,
+                            client_profile=standard_request.client_profile,
+                            build_final_directive=lambda answer_text: build_tool_directive(
+                                standard_request,
+                                RuntimeAttemptState(answer_text=answer_text),
+                            ),
+                            allowed_tool_names=standard_request.tool_names,
+                        )
 
-                    async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
-                        translator.on_delta(evt, text_chunk, tool_calls)
+                        async def on_delta(evt: dict[str, Any], text_chunk: str | None, tool_calls: list[dict[str, Any]] | None) -> None:
+                            translator.on_delta(evt, text_chunk, tool_calls)
 
-                    delta_handler: OpenAIDeltaHandler = on_delta
-                    result = await run_retryable_completion_bridge(
-                        client=client,
-                        standard_request=standard_request,
-                        prompt=prompt,
-                        users_db=users_db,
-                        token=token,
-                        history_messages=history_messages,
-                        max_attempts=request_max_attempts(standard_request),
-                        usage_delta_factory=build_usage_delta_factory(prompt),
-                        allow_after_visible_output=True,
-                        capture_events=False,
-                        on_delta=delta_handler,
-                    )
-                    execution = result.execution
-                    directive = result.directive or build_tool_directive(standard_request, execution.state)
-                    final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
-                    for chunk in translator.finalize(final_finish_reason):
-                        yield chunk
-                    return
-                except HTTPException as he:
-                    yield f"data: {json.dumps({'error': he.detail})}\n\n"
-                    return
-                except Exception as e:
-                    yield f"data: {json.dumps({'error': str(e)})}\n\n"
-                    return
+                        result = await run_retryable_completion_bridge(
+                            client=client,
+                            standard_request=standard_request,
+                            prompt=prompt,
+                            users_db=users_db,
+                            token=token,
+                            history_messages=history_messages,
+                            max_attempts=request_max_attempts(standard_request),
+                            usage_delta_factory=build_usage_delta_factory(prompt),
+                            allow_after_visible_output=True,
+                            capture_events=False,
+                            on_delta=on_delta,
+                        )
+                        execution = result.execution
+                        directive = result.directive or build_tool_directive(standard_request, execution.state)
+                        assistant_message = build_openai_assistant_history_message(
+                            execution=execution,
+                            request=standard_request,
+                            directive=directive,
+                        )
+                        await persist_session_turn(
+                            app=app,
+                            request=standard_request,
+                            surface="openai",
+                            execution=execution,
+                            assistant_message=assistant_message,
+                        )
+                        final_finish_reason = "tool_calls" if directive.stop_reason == "tool_use" else execution.state.finish_reason
+                        for chunk in translator.finalize(final_finish_reason):
+                            yield chunk
+                        return
+                    except HTTPException as he:
+                        await clear_invalidated_session_chat(app=app, request=standard_request)
+                        yield f"data: {json.dumps({'error': he.detail})}\n\n"
+                        return
+                    except Exception as e:
+                        await clear_invalidated_session_chat(app=app, request=standard_request)
+                        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                        return
 
             return StreamingResponse(
                 generate(),
@@ -149,27 +194,42 @@ async def chat_completions(request: Request):
             )
 
         try:
-            update_request_context(stream_attempt=1)
-            result = await run_retryable_completion_bridge(
-                client=client,
-                standard_request=standard_request,
-                prompt=prompt,
-                users_db=users_db,
-                token=token,
-                history_messages=history_messages,
-                max_attempts=request_max_attempts(standard_request),
-                usage_delta_factory=build_usage_delta_factory(prompt),
-                allow_after_visible_output=True,
-            )
-            execution = result.execution
+            async with app.state.session_locks.hold(session_key):
+                update_request_context(stream_attempt=1)
+                result = await run_retryable_completion_bridge(
+                    client=client,
+                    standard_request=standard_request,
+                    prompt=prompt,
+                    users_db=users_db,
+                    token=token,
+                    history_messages=history_messages,
+                    max_attempts=request_max_attempts(standard_request),
+                    usage_delta_factory=build_usage_delta_factory(prompt),
+                    allow_after_visible_output=True,
+                )
+                execution = result.execution
+                directive = result.directive or build_tool_directive(standard_request, execution.state)
+                assistant_message = build_openai_assistant_history_message(
+                    execution=execution,
+                    request=standard_request,
+                    directive=directive,
+                )
+                await persist_session_turn(
+                    app=app,
+                    request=standard_request,
+                    surface="openai",
+                    execution=execution,
+                    assistant_message=assistant_message,
+                )
 
-            return JSONResponse(build_openai_completion_payload(
-                completion_id=completion_id,
-                created=created,
-                model_name=model_name,
-                prompt=prompt,
-                execution=execution,
-                standard_request=standard_request,
-            ))
+                return JSONResponse(build_openai_completion_payload(
+                    completion_id=completion_id,
+                    created=created,
+                    model_name=model_name,
+                    prompt=result.prompt,
+                    execution=execution,
+                    standard_request=standard_request,
+                ))
         except Exception as e:
+            await clear_invalidated_session_chat(app=app, request=standard_request)
             raise HTTPException(status_code=500, detail=str(e))

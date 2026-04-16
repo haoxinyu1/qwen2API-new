@@ -114,7 +114,12 @@ class QwenClient:
             yield event
 
     async def stream_chat_once(self, token: str, chat_id: str, payload: dict) -> AsyncIterator[dict]:
-        timeout = httpx.Timeout(connect=30.0, read=1800.0, write=30.0, pool=30.0)
+        # 降低read timeout，避免模型卡住时长时间等待
+        # connect: 连接超时30秒
+        # read: 读取超时120秒（2分钟内没有新数据就超时）
+        # write: 写入超时30秒
+        # pool: 连接池超时30秒
+        timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
         async with httpx.AsyncClient(timeout=timeout) as hc:
             async with hc.stream(
                 "POST",
@@ -130,6 +135,21 @@ class QwenClient:
                         yield {"chunk": chunk}
                 yield {"status": "streamed"}
 
-    async def chat_stream_events_with_retry(self, model: str, content: str, has_custom_tools: bool = False, files: list[dict] | None = None, fixed_account=None):
-        async for item in self.executor.chat_stream_events_with_retry(model, content, has_custom_tools, files=files, fixed_account=fixed_account):
+    async def chat_stream_events_with_retry(
+        self,
+        model: str,
+        content: str,
+        has_custom_tools: bool = False,
+        files: list[dict] | None = None,
+        fixed_account=None,
+        existing_chat_id: str | None = None,
+    ):
+        async for item in self.executor.chat_stream_events_with_retry(
+            model,
+            content,
+            has_custom_tools,
+            files=files,
+            fixed_account=fixed_account,
+            existing_chat_id=existing_chat_id,
+        ):
             yield item

@@ -19,10 +19,7 @@ _REQUEST_DEFAULTS: dict[str, Any] = {
 }
 
 _LOG_FORMAT = (
-    "%(asctime)s [%(levelname)s] [req=%(req_id)s surface=%(surface)s "
-    "requested=%(requested_model)s resolved=%(resolved_model)s "
-    "chat=%(chat_id)s sattempt=%(stream_attempt)s uattempt=%(upstream_attempt)s] "
-    "%(message)s"
+    "%(asctime)s [%(levelname)s] %(message)s"
 )
 
 
@@ -49,23 +46,25 @@ def configure_logging(level: int = logging.INFO) -> None:
     root = logging.getLogger()
     root.setLevel(level)
 
-    if not any(isinstance(f, RequestContextFilter) for f in root.filters):
-        root.addFilter(request_context_filter)
+    # 应用精简日志过滤器
+    try:
+        from backend.core.log_filter import SimplifiedLogFilter
+        if not any(isinstance(f, SimplifiedLogFilter) for f in root.filters):
+            root.addFilter(SimplifiedLogFilter())
+    except ImportError:
+        pass
 
     formatter = SafeRequestFormatter(_LOG_FORMAT)
 
     if not root.handlers:
         handler = logging.StreamHandler()
         handler.setLevel(level)
-        handler.addFilter(request_context_filter)
         handler.setFormatter(formatter)
         root.addHandler(handler)
         return
 
     for handler in root.handlers:
         handler.setLevel(level)
-        if not any(isinstance(f, RequestContextFilter) for f in handler.filters):
-            handler.addFilter(request_context_filter)
         handler.setFormatter(formatter)
 
 

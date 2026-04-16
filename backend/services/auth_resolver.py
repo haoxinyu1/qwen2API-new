@@ -1,20 +1,16 @@
 import asyncio
+import html as html_lib
+import json
 import logging
-from backend.core.account_pool import AccountPool, Account
-# from backend.core.browser_engine import _new_browser  # 已删除浏览器支持
-from backend.core.config import settings
-from backend.core.account_pool import Account
-import logging
-import asyncio
 import random
+import re
 import string
 import time
-import json
-import html as html_lib
-import re
 from typing import Optional
-# from camoufox.async_api import AsyncCamoufox  # 已删除浏览器支持
 
+from backend.core.account_pool import Account, AccountPool
+from backend.core.browser_engine import _new_browser
+from backend.core.config import settings
 log = logging.getLogger(__name__)
 
 BASE_URL = "https://chat.qwen.ai"

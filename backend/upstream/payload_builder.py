@@ -30,6 +30,10 @@ def build_chat_payload(chat_id: str, model: str, content: str, has_custom_tools:
         # upstream interception such as `Tool Read/Bash does not exists.` for custom
         # local tools that only exist in the bridge layer.
         "function_calling": False,
+        # Additional safeguards to prevent tool call interception
+        "enable_tools": False,
+        "enable_function_call": False,
+        "tool_choice": "none",
     }
     return {
         "stream": True,

@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-import httpx
+import oss2
 
 
 def _file_class_from_content_type(content_type: str) -> str:
@@ -19,6 +19,13 @@ def _file_class_from_content_type(content_type: str) -> str:
     if lowered.startswith("video/"):
         return "video"
     return "document"
+
+
+def _normalize_sign_region(region: str) -> str:
+    region = (region or "").strip()
+    if region.startswith("oss-"):
+        return region[len("oss-"):]
+    return region
 
 
 class UpstreamFileUploader:
@@ -48,15 +55,30 @@ class UpstreamFileUploader:
         sts_data = json.loads(sts_resp.get("body", "{}"))
         sts = (sts_data.get("data") or {}) if isinstance(sts_data, dict) else {}
         file_id = sts.get("file_id")
-        file_url = sts.get("file_url")
         file_path_remote = sts.get("file_path", "")
-        if not file_id or not file_url:
+        bucketname = sts.get("bucketname", "")
+        endpoint = sts.get("endpoint", "")
+        region = _normalize_sign_region(sts.get("region", ""))
+        access_key_id = sts.get("access_key_id", "")
+        access_key_secret = sts.get("access_key_secret", "")
+        security_token = sts.get("security_token", "")
+        if not file_id or not file_path_remote or not bucketname or not endpoint:
             raise RuntimeError(f"getstsToken missing file data: {sts_data}")
 
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, write=60.0, read=60.0, connect=30.0), follow_redirects=True) as hc:
-            put_resp = await hc.put(file_url, content=raw, headers={"Content-Type": content_type})
-        if put_resp.status_code not in (200, 201):
-            raise RuntimeError(f"OSS PUT failed: {put_resp.status_code} {put_resp.text[:200]}")
+        auth = oss2.StsAuth(access_key_id, access_key_secret, security_token, auth_version='v4')
+        bucket = oss2.Bucket(
+            auth,
+            f"https://{endpoint}",
+            bucketname,
+            region=region,
+        )
+        put_result = bucket.put_object(
+            file_path_remote,
+            raw,
+            headers={"Content-Type": content_type},
+        )
+        if getattr(put_result, 'status', None) not in (200, 201):
+            raise RuntimeError(f"OSS put_object failed: status={getattr(put_result, 'status', None)}")
 
         parse_resp = await self.client._request_json(
             "POST",
@@ -95,6 +117,7 @@ class UpstreamFileUploader:
 
         user_id = file_path_remote.split('/', 1)[0] if '/' in file_path_remote else ""
         now_ms = int(time.time() * 1000)
+        put_url = f"https://{bucketname}.{endpoint}/{file_path_remote.lstrip('/')}"
         remote_ref = {
             "type": "file",
             "file": {
@@ -113,7 +136,7 @@ class UpstreamFileUploader:
                 "update_at": now_ms,
             },
             "id": file_id,
-            "url": file_url,
+            "url": put_url,
             "name": filename,
             "collection_name": "",
             "progress": 0,
@@ -138,5 +161,4 @@ class UpstreamFileUploader:
 
     async def delete_remote_file(self, acc, remote_meta: dict[str, Any]) -> bool:
         # Qwen web upload delete API has not been fully confirmed yet.
-        # Keep this as a best-effort hook so cleanup flow can call it safely.
         return False

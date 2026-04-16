@@ -9,7 +9,7 @@ from backend.core.request_logging import get_request_context
 from backend.toolcall.normalize import build_tool_name_registry, normalize_tool_name
 from backend.toolcall.parser import parse_tool_calls_detailed
 
-__all__ = ["parse_tool_calls", "parse_tool_calls_detailed", "inject_format_reminder", "parse_tool_calls_silent"]
+__all__ = ["parse_tool_calls", "parse_tool_calls_detailed", "inject_format_reminder", "parse_tool_calls_silent", "ToolSieve"]
 
 log = logging.getLogger("qwen2api.tool_parser")
 
@@ -75,6 +75,8 @@ def _extract_first_xml_tool_call(text: str) -> str | None:
 
 def _extract_first_json_tool_call(text: str) -> str | None:
     normalized = text.strip()
+
+    # 优先查找完整的 JSON 对象
     markers = [
         '<tool_call>{"name"',
         '<tool_calls><tool_call>{"name"',
@@ -108,7 +110,15 @@ def _extract_first_json_tool_call(text: str) -> str | None:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return candidate[json_start:idx + 1]
+                json_str = candidate[json_start:idx + 1]
+                # 验证是否是有效的工具调用 JSON
+                try:
+                    obj = json.loads(json_str)
+                    if isinstance(obj, dict) and "name" in obj:
+                        return json_str
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                return json_str
     return candidate[json_start:]
 
 
@@ -149,10 +159,93 @@ def _normalize_fragmented_tool_call(answer: str) -> str:
 
 
 def _coerce_tool_input(name: str, input_data: Any, tools: list[dict[str, Any]]) -> Any:
-    del name
     if not isinstance(input_data, dict):
         return input_data
 
+    # 修正 AskUserQuestion 工具参数
+    if name == "AskUserQuestion":
+        fixed = dict(input_data)
+
+        # 如果只有 question 字段，转换为 questions 数组
+        if "question" in fixed and "questions" not in fixed:
+            question_text = fixed.pop("question")
+            fixed["questions"] = [{
+                "question": question_text,
+                "header": "Question",
+                "options": [
+                    {"label": "Yes", "description": "Confirm"},
+                    {"label": "No", "description": "Decline"}
+                ],
+                "multiSelect": False
+            }]
+            log.info(f"[ToolCoerce] Fixed AskUserQuestion: converted 'question' to 'questions' array")
+
+        # 确保 questions 是数组
+        if "questions" in fixed:
+            if not isinstance(fixed["questions"], list):
+                fixed["questions"] = [fixed["questions"]]
+
+            # 验证每个问题的格式
+            for i, q in enumerate(fixed["questions"]):
+                if not isinstance(q, dict):
+                    continue
+
+                # 确保有必需字段
+                if "question" not in q:
+                    q["question"] = "Please provide your input"
+                if "header" not in q:
+                    q["header"] = "Question"
+                if "multiSelect" not in q:
+                    q["multiSelect"] = False
+
+                # 确保 options 格式正确
+                if "options" not in q:
+                    q["options"] = [
+                        {"label": "Continue", "description": "Proceed"},
+                        {"label": "Cancel", "description": "Stop"}
+                    ]
+                elif isinstance(q.get("options"), list):
+                    for j, opt in enumerate(q["options"]):
+                        if isinstance(opt, str):
+                            q["options"][j] = {"label": opt, "description": opt}
+                        elif isinstance(opt, dict):
+                            if "label" not in opt:
+                                opt["label"] = opt.get("description", f"Option {j+1}")
+                            if "description" not in opt:
+                                opt["description"] = opt.get("label", "")
+
+        return fixed
+
+    # 修正 Agent 工具参数
+    if name == "Agent":
+        fixed = dict(input_data)
+        if "description" not in fixed:
+            fixed["description"] = "Execute sub-task"
+        if "prompt" not in fixed:
+            fixed["prompt"] = fixed.get("description", "Execute the task")
+        return fixed
+
+    # 修正 Read 工具参数
+    if name == "Read":
+        fixed = dict(input_data)
+        if "file_path" not in fixed:
+            if "path" in fixed:
+                fixed["file_path"] = fixed.pop("path")
+            elif "filename" in fixed:
+                fixed["file_path"] = fixed.pop("filename")
+        return fixed
+
+    # 修正 Bash 工具参数
+    if name == "Bash":
+        fixed = dict(input_data)
+        if "command" not in fixed:
+            if "cmd" in fixed:
+                fixed["command"] = fixed.pop("cmd")
+            elif "script" in fixed:
+                fixed["command"] = fixed.pop("script")
+        return fixed
+
+    # 原有的 query/queries 转换逻辑
     query_value = input_data.get("query")
     queries = input_data.get("queries")
     if query_value or "queries" not in input_data:
@@ -205,7 +298,8 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
         if emit_logs:
             log.warning(message)
 
-    _log_debug(f"[ToolParse] [{req_tag}] 原始回复({len(answer)}字): {answer[:200]!r}")
+    # 强制记录原始输入用于调试
+    log.info(f"[ToolParse] [{req_tag}] 原始回复({len(answer)}字): {answer[:500]!r}")
 
     def _make_tool_block(name, input_data, prefix=""):
         normalized_name = normalize_tool_name(name, tool_registry.values())
@@ -299,8 +393,187 @@ def _parse_tool_calls(answer: str, tools: list, *, emit_logs: bool):
         })
         return blocks, "tool_use"
 
+    # 尝试解析纯 JSON 格式: {"name": "...", "input": {...}}
+    stripped_clean = stripped.strip()
+    try:
+        if stripped_clean.startswith('{') and stripped_clean.endswith('}'):
+            obj = json.loads(stripped_clean)
+            if isinstance(obj, dict) and "name" in obj:
+                name = obj.get("name", "")
+                inp = obj.get("input", obj.get("args", obj.get("arguments", obj.get("parameters", {}))))
+                if isinstance(inp, str):
+                    try:
+                        inp = json.loads(inp)
+                    except Exception:
+                        inp = {"value": inp}
+                _log_info(f"[ToolParse] ✓ 纯JSON格式: name={name!r}, input={str(inp)[:120]}")
+                return _make_tool_block(name, inp)
+    except (json.JSONDecodeError, ValueError) as e:
+        _log_debug(f"[ToolParse] 纯JSON格式解析失败: {e}, content={stripped_clean[:200]!r}")
+
     _log_warning(f"[ToolParse] ✗ 未检测到工具调用，作为普通文本返回。工具列表: {tool_names}")
     return [{"type": "text", "text": answer}], "end_turn"
+
+
+class ToolSieve:
+    """工具调用流式检测器 - 实时检测并分离工具调用"""
+
+    def __init__(self, tool_names: list[str]):
+        self.tool_names = set(tool_names) if tool_names else set()
+        self.pending = ""
+        self.capture = ""
+        self.capturing = False
+        self.pending_tool_calls = []
+        self.tool_calls_detected = False
+
+    def process_chunk(self, chunk: str) -> list[dict]:
+        """
+        处理一个chunk，返回事件列表
+        事件类型：
+        - {"type": "content", "text": "..."}  # 普通文本
+        - {"type": "tool_calls", "calls": [...]}  # 工具调用
+        """
+        if not chunk:
+            return []
+
+        self.pending += chunk
+        events = []
+
+        # 如果正在捕获工具调用
+        if self.capturing:
+            self.capture += self.pending
+            self.pending = ""
+
+            # 尝试解析
+            prefix, calls, suffix, ready = self._consume_tool_capture()
+
+            if ready and calls:
+                # 解析成功
+                if prefix:
+                    events.append({"type": "content", "text": prefix})
+
+                self.pending_tool_calls = calls
+                self.tool_calls_detected = True
+                self.pending = suffix
+                self.capture = ""
+                self.capturing = False
+
+            return events
+
+        # 检测工具调用开始
+        start = self._find_tool_start(self.pending)
+
+        if start >= 0:
+            # 找到工具调用开始
+            prefix = self.pending[:start]
+            if prefix:
+                events.append({"type": "content", "text": prefix})
+
+            self.capture = self.pending[start:]
+            self.pending = ""
+            self.capturing = True
+        else:
+            # 没找到，输出安全部分
+            safe, hold = self._split_safe_content(self.pending)
+            if safe:
+                events.append({"type": "content", "text": safe})
+            self.pending = hold
+
+        return events
+
+    def _find_tool_start(self, text: str) -> int:
+        """查找工具调用开始位置"""
+        markers = [
+            '{"name":',
+            '<tool_call>',
+            '##TOOL_CALL##',
+            'function.name:',
+        ]
+
+        positions = []
+        for marker in markers:
+            pos = text.find(marker)
+            if pos >= 0:
+                positions.append(pos)
+
+        return min(positions) if positions else -1
+
+    def _consume_tool_capture(self) -> tuple[str, list, str, bool]:
+        """尝试解析捕获的工具调用"""
+        if not self.capture:
+            return "", [], "", False
+
+        # 尝试解析工具调用
+        try:
+            # 使用现有的解析逻辑
+            blocks, stop_reason = parse_tool_calls_silent(self.capture,
+                [{"name": name} for name in self.tool_names])
+
+            if stop_reason == "tool_use":
+                # 找到工具��用
+                tool_blocks = [b for b in blocks if b.get("type") == "tool_use"]
+                if tool_blocks:
+                    # 转换为标准格式
+                    calls = [{
+                        "name": tb["name"],
+                        "input": tb["input"]
+                    } for tb in tool_blocks]
+
+                    # 提取前缀文本
+                    text_blocks = [b for b in blocks if b.get("type") == "text"]
+                    prefix = text_blocks[0]["text"] if text_blocks else ""
+
+                    return prefix, calls, "", True
+        except Exception as e:
+            log.debug(f"[ToolSieve] 解析失败: {e}")
+
+        # 还不完整或解析失败
+        return "", [], "", False
+
+    def _split_safe_content(self, text: str) -> tuple[str, str]:
+        """分离安全内容和需要保留的部分"""
+        # 保留最后几个字符，防止工具调用标记被截断
+        if len(text) < 20:
+            return "", text
+
+        return text[:-10], text[-10:]
+
+    def flush(self) -> list[dict]:
+        """刷新剩余内容"""
+        events = []
+
+        if self.pending_tool_calls:
+            events.append({"type": "tool_calls", "calls": self.pending_tool_calls})
+            self.pending_tool_calls = []
+
+        if self.capturing and self.capture:
+            # 尝试最后一次解析
+            prefix, calls, suffix, ready = self._consume_tool_capture()
+            if ready and calls:
+                if prefix:
+                    events.append({"type": "content", "text": prefix})
+                events.append({"type": "tool_calls", "calls": calls})
+                self.tool_calls_detected = True
+                if suffix:
+                    events.append({"type": "content", "text": suffix})
+            else:
+                # 解析失败，检查是否看起来像工具调用
+                if not self._looks_like_incomplete_tool_call(self.capture):
+                    events.append({"type": "content", "text": self.capture})
+
+        if self.pending:
+            events.append({"type": "content", "text": self.pending})
+
+        return events
+
+    def _looks_like_incomplete_tool_call(self, text: str) -> bool:
+        """检查文本是否看起来像不完整的工具调用"""
+        markers = ['{"name":', '<tool_call>', '##TOOL_CALL##', 'function.name:']
+        return any(marker in text for marker in markers)
+
+    def has_tool_calls(self) -> bool:
+        """是否检测到工具调用"""
+        return self.tool_calls_detected or bool(self.pending_tool_calls)
 
 
 def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str = OPENCLAW_OPENAI_PROFILE) -> str:
@@ -308,19 +581,34 @@ def inject_format_reminder(prompt: str, tool_name: str, *, client_profile: str =
     Used when Qwen server returns 'Tool X does not exists.' (native call was intercepted)."""
     if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
         reminder = (
-            f"[CORRECTION]: You called '{tool_name}' using the wrong tool-call format, and the server rejected it with "
-            f"'Tool {tool_name} does not exists.'. Reissue the tool call as a single valid JSON object only:\n"
-            f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
-            "Do not wrap it in ##TOOL_CALL## blocks. Do not use XML tags. Do not add explanation text before or after the JSON.\n"
+            f"[严重错误/CRITICAL ERROR]: 你的输出中出现了 'Tool {tool_name} does not exists.' 这说明你试图描述工具调用而不是真正调用它。\n"
+            f"The text 'Tool {tool_name} does not exists.' appeared in your output. "
+            f"This means you tried to describe a tool call instead of actually calling it.\n\n"
+            f"要调用 {tool_name}，只输出这个精确的JSON格式，不要有其他文本：\n"
+            f"To call {tool_name}, output ONLY this exact JSON format with NO other text:\n"
+            f'{{"name": "{tool_name}", "input": {{"arg1": "value1", "arg2": "value2"}}}}\n\n'
+            f"规则/RULES:\n"
+            f"- 只输出JSON对象，不要有其他内容 / Output ONLY the JSON object, nothing else\n"
+            f"- 前后不要有解释性文字 / NO explanatory text before or after\n"
+            f"- 不要用markdown代码块 / NO markdown code blocks\n"
+            f"- 不要用XML标签如<tool_call> / NO XML tags like <tool_call>\n"
+            f"- 不要用##TOOL_CALL##标记 / NO ##TOOL_CALL## markers\n"
+            f"- 只要纯JSON对象 / Just the raw JSON object\n\n"
+            f"Read工具示例 / Example for Read tool:\n"
+            f'{{"name": "Read", "input": {{"file_path": "/path/to/file"}}}}\n'
         )
     else:
         reminder = (
-            f"[CORRECTION]: You called '{tool_name}' using the WRONG format — "
+            f"[纠正/CORRECTION]: 你用错误的格式调用了 '{tool_name}' — "
+            f"服务器用 'Tool {tool_name} does not exists.' 阻止了它。\n"
+            f"You called '{tool_name}' using the WRONG format — "
             f"the server BLOCKED it with 'Tool {tool_name} does not exists.'. "
+            f"你必须使用##TOOL_CALL##格式，不能用其他格式：\n"
             f"You MUST use ##TOOL_CALL## format and NOTHING ELSE:\n"
             f"##TOOL_CALL##\n"
             f'{{"name": {json.dumps(tool_name)}, "input": {{...your args here...}}}}\n'
             f"##END_CALL##\n"
+            f"不要用没有分隔符的JSON。不要用任何XML标签。只能用##TOOL_CALL##。\n"
             f"DO NOT use JSON without delimiters. DO NOT use any XML tags. ONLY ##TOOL_CALL##.\n"
         )
     prompt = prompt.rstrip()

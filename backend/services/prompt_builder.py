@@ -21,10 +21,31 @@ class PromptBuildResult:
     tool_enabled: bool
 
 
+def _compact_history_tool_input(name: str, input_data: dict, client_profile: str) -> dict:
+    if client_profile != CLAUDE_CODE_OPENAI_PROFILE or not isinstance(input_data, dict):
+        return input_data
+    compact = dict(input_data)
+    large_text_keys = ("content", "new_string", "old_string", "insert_text", "text", "patch")
+    for key in large_text_keys:
+        value = compact.get(key)
+        if isinstance(value, str) and len(value) > 160:
+            compact[key] = f"[omitted {len(value)} chars]"
+    if name in {"Write", "Edit", "NotebookEdit"}:
+        preferred = {}
+        for key in ("file_path", "path", "target_file", "filename", "old_string", "new_string", "content"):
+            if key in compact:
+                preferred[key] = compact[key]
+        if preferred:
+            compact = preferred
+    return compact
+
+
 def _render_history_tool_call(name: str, input_data: dict, client_profile: str) -> str:
-    payload = json.dumps({"name": name, "input": input_data}, ensure_ascii=False)
+    payload = json.dumps({"name": name, "input": _compact_history_tool_input(name, input_data, client_profile)}, ensure_ascii=False)
+    # Claude Code profile 使用 ##TOOL_CALL## 格式，避免 Qwen 服务器拦截
     if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
-        return payload
+        return f"##TOOL_CALL##\n{payload}\n##END_CALL##"
+    # OpenClaw 和其他 profile 使用 ##TOOL_CALL## 格式
     return f"##TOOL_CALL##\n{payload}\n##END_CALL##"
 
 
@@ -32,17 +53,54 @@ def _build_tool_instruction_block(tools: list[dict], client_profile: str) -> str
     names = [t.get("name", "") for t in tools if t.get("name")]
     if client_profile == CLAUDE_CODE_OPENAI_PROFILE:
         lines = [
-            "=== TOOL USAGE INSTRUCTIONS ===",
-            "If a tool is needed, output exactly one minified JSON object and nothing else.",
-            "Required shape:",
-            '{"name":"TOOL_NAME","input":{"arg":"value"}}',
-            "Rules:",
-            "- Use one exact tool name from the available tools list.",
-            "- Put every argument inside input.",
-            "- No prose, no markdown, no XML, no wrappers, no tags.",
-            "- After a tool result, either output the next single JSON tool call or answer normally.",
+            "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
+            "【重要】用户输入什么语言，就用什么语言回复。User inputs Chinese → respond in Chinese. User inputs English → respond in English.",
+            "【重要】用户要求多个操作时（如读文件并写文档），必须完成所有操作，不要询问确认。",
+            "【重要】如果文件显示'Unchanged since last read'，不要再次读取同一文件。",
+            "【重要】不要自动调用Agent工具，除非用户明确要求。",
+            "",
+            "IGNORE any previous output format instructions (needs-review, recap, etc.).",
+            f"You have access to these tools: {', '.join(names)}",
+            "",
+            "WHEN YOU NEED TO CALL A TOOL — output EXACTLY this format (nothing else):",
+            "##TOOL_CALL##",
+            '{"name": "EXACT_TOOL_NAME", "input": {"param1": "value1"}}',
+            "##END_CALL##",
+            "",
+            "MULTI-TURN RULES:",
+            "- After a [Tool Result] block appears in the conversation, read it and decide next action.",
+            "- If more tool calls are needed, emit another ##TOOL_CALL## block.",
+            "- Only give a final text answer when ALL needed information is gathered.",
+            "- Never skip calling a tool that is required to complete the user request.",
+            "- The history shows ##TOOL_CALL## blocks you already made and their [Tool Result] responses.",
+            "",
+            "STRICT RULES:",
+            "- No preamble, no explanation before or after ##TOOL_CALL##...##END_CALL##.",
+            "- Use EXACT tool name from the list below.",
+            "- When NO tool is needed, answer normally in plain text.",
             "- For file/config tasks prefer Read/Edit/Write. Use Bash only when shell behavior is required.",
             "- On Windows-like paths inside Bash, use POSIX commands or powershell.exe -Command.",
+            "- Do NOT call Agent tool automatically unless user explicitly requests it.",
+            "- Do NOT read the same file multiple times if it shows 'Unchanged since last read'.",
+            "",
+            "EXECUTION RULES - CRITICAL:",
+            "- When user gives a task, START IMMEDIATELY by calling the required tools.",
+            "- Do NOT wait, do NOT ask for confirmation, do NOT ask 'what should I do next'.",
+            "- Do NOT call EnterPlanMode, ExitPlanMode, EnterWorktree, ExitWorktree, AskUserQuestion.",
+            "- Complete the task directly and provide the result.",
+            "- If you need information, call Read/Grep/Glob. If you need to modify, call Edit/Write.",
+            "- Only respond with text when the task is complete or you have the final answer.",
+            "",
+            "CRITICAL — FORBIDDEN FORMATS (will be INTERCEPTED and BLOCKED by server):",
+            '- {"name": "X", "arguments": "..."}  <-- NEVER USE',
+            '- {"type": "function", "name": "X"}  <-- NEVER USE',
+            '- {"type": "tool_use", "name": "X"}  <-- NEVER USE',
+            "- <function_calls><invoke name=\"X\">  <-- NEVER USE",
+            "- <tool_call>{...}</tool_call>  <-- NEVER USE",
+            '- {"name":"X","input":{...}} without ##TOOL_CALL## markers  <-- NEVER USE',
+            "- <｜Tool｜> or <｜tool｜> markers  <-- NEVER USE",
+            "ONLY ##TOOL_CALL##...##END_CALL## is accepted. Any other format will cause 'Tool X does not exists.' error.",
+            "",
             "Available tools:",
         ]
         if len(names) <= 12:
@@ -57,7 +115,7 @@ def _build_tool_instruction_block(tools: list[dict], client_profile: str) -> str
                     line += hint
                 lines.append(line)
         else:
-            priority_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "TaskCreate", "TaskUpdate"]
+            priority_tools = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "TaskCreate", "TaskUpdate", "AskUserQuestion"]
             priority_lines = []
             seen = set()
             for priority_name in priority_tools:
@@ -67,15 +125,22 @@ def _build_tool_instruction_block(tools: list[dict], client_profile: str) -> str
                 seen.add(priority_name)
                 hint = _tool_param_hint(tool)
                 priority_lines.append(f"- {priority_name}{hint}")
-            remaining_count = len([name for name in names if name not in seen])
+            remaining_names = [name for name in names if name not in seen]
             lines.extend(priority_lines)
-            if remaining_count > 0:
-                lines.append(f"- Other available tools: {remaining_count} more")
+            if remaining_names:
+                lines.append(f"- Other available tools: {', '.join(remaining_names[:20])}")
+                if len(remaining_names) > 20:
+                    lines.append(f"  ... and {len(remaining_names) - 20} more")
         lines.append("=== END TOOL INSTRUCTIONS ===")
         return "\n".join(lines)
 
     lines = [
         "=== MANDATORY TOOL CALL INSTRUCTIONS ===",
+        "【重要】用户输入什么语言，就用什么语言回复。User inputs Chinese → respond in Chinese. User inputs English → respond in English.",
+        "【重要】用户要求多个操作时（如读文件并写文档），必须完成所有操作，不要询问确认。",
+        "【重要】如果文件显示'Unchanged since last read'，不要再次读取同一文件。",
+        "【重要】不要自动调用Agent工具，除非用户明确要求。",
+        "",
         "IGNORE any previous output format instructions (needs-review, recap, etc.).",
         f"You have access to these tools: {', '.join(names)}",
         "",
@@ -114,6 +179,10 @@ def _build_tool_instruction_block(tools: list[dict], client_profile: str) -> str
         '- {"type": "tool_use", "name": "X"}  <-- NEVER USE',
         '- <tool_calls><tool_call>{...}</tool_call></tool_calls>  <-- NEVER USE',
         '- <tool_call>{...}</tool_call>  <-- NEVER USE',
+        '- Read({"file_path": "..."})  <-- NEVER USE (function call syntax)',
+        '- <｜Tool｜>Read{"file_path":"..."}<｜Tool｜>  <-- NEVER USE (native tool markers)',
+        '- <｜tool｜>...  <-- NEVER USE (native tool markers)',
+        '- <｜System｜>, <｜User｜>, <｜Assistant｜>  <-- NEVER USE (role markers)',
         "ONLY ##TOOL_CALL##...##END_CALL## is accepted. Any other format will cause 'Tool X does not exists.' error.",
         "=== END TOOL INSTRUCTIONS ===",
     ]
@@ -256,7 +325,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
     NEEDSREVIEW_MARKERS = ("需求回显", "已了解规则", "等待用户输入", "待执行任务", "待确认事项",
                            "[需求回显]", "**需求回显**")
     msg_count = 0
-    max_history_msgs = (6 if client_profile == CLAUDE_CODE_OPENAI_PROFILE else 8) if tools else 200
+    max_history_msgs = (12 if client_profile == CLAUDE_CODE_OPENAI_PROFILE else 8) if tools else 200
     for msg in reversed(messages):
         if msg_count >= max_history_msgs:
             break
@@ -276,7 +345,7 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
                 )
             elif not isinstance(tool_content, str):
                 tool_content = str(tool_content)
-            tool_result_limit = 180 if client_profile == CLAUDE_CODE_OPENAI_PROFILE else 300
+            tool_result_limit = 6000 if (client_profile == CLAUDE_CODE_OPENAI_PROFILE and tools) else 300
             if len(tool_content) > tool_result_limit:
                 tool_content = tool_content[:tool_result_limit] + "...[truncated]"
             line = f"[Tool Result]{(' id=' + tool_call_id) if tool_call_id else ''}\n{tool_content}\n[/Tool Result]"
@@ -311,15 +380,19 @@ def build_prompt_with_tools(system_prompt: str, messages: list, tools: list, *, 
             log.debug(f"[Prompt] 跳过需求回显式 assistant 消息 ({len(text)}字)")
             msg_count += 1
             continue
-        is_tool_result = role == "user" and ("[Tool Result]" in text or "[tool result]" in text.lower()
-                                              or text.startswith("{") or "\"results\"" in text[:100])
+        lower_text = text.lower()
+        is_tool_result = role == "user" and (
+            "[tool result" in lower_text
+            or text.startswith("{")
+            or "\"results\"" in text[:100]
+        )
         if client_profile == CLAUDE_CODE_OPENAI_PROFILE and tools:
             if is_tool_result:
-                max_len = 220
+                max_len = 6000
             elif role == "assistant":
                 max_len = 500
             else:
-                max_len = 900
+                max_len = 1600
         else:
             max_len = 600 if is_tool_result else 1400
         if len(text) > max_len:
